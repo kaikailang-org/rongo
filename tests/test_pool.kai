@@ -1,0 +1,42 @@
+# Pure policy checks for the connection pool — no network, no FFI.
+# These exercise the two decisions the pool makes without touching a
+# connection: whether an idle connection is still fresh (eviction), and
+# whether a host has room for one more idle connection (the per-host cap).
+
+import rongo.pool
+import time
+
+# Fabricate an Instant n nanoseconds after the epoch. `is_fresh` only cares
+# about the difference between two instants, so absolute values are free.
+fn at(ns: Int) : Instant = instant_of_nanos(ns)
+
+test "an idle connection younger than max_idle is fresh" {
+  # since = 0ns, now = 1s, max_idle = 2s → aged 1s < 2s → fresh.
+  assert pool.is_fresh(at(0), at(1_000_000_000), seconds(2))
+}
+
+test "an idle connection older than max_idle is stale" {
+  # aged 3s, max_idle 2s → not fresh.
+  assert not pool.is_fresh(at(0), at(3_000_000_000), seconds(2))
+}
+
+test "idle age exactly at max_idle is stale (strict less-than)" {
+  # aged exactly 2s, max_idle 2s → 2s < 2s is false → stale.
+  assert not pool.is_fresh(at(0), at(2_000_000_000), seconds(2))
+}
+
+test "a host below the cap has room" {
+  let cfg = pool.PoolConfig { max_per_host: 8, max_idle: seconds(90), trust: pool.System }
+  assert pool.should_keep(7, cfg)
+}
+
+test "a host at the cap has no room" {
+  let cfg = pool.PoolConfig { max_per_host: 8, max_idle: seconds(90), trust: pool.System }
+  assert not pool.should_keep(8, cfg)
+}
+
+test "an empty host always has room" {
+  assert pool.should_keep(0, pool.default_pool_config())
+}
+
+fn main() : Int = 0

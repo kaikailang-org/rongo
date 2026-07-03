@@ -42,6 +42,17 @@ is a reusable element, not a framework opinion.
   and a cancel unwinds the server cleanly. Server-side keep-alive: a
   connection serves many requests until `Connection: close` or the peer
   closes. `max_request_bytes` caps one request's buffer.
+- **0.6.0** — the client connection pool: `rongo.pool` reuses connections
+  across requests to a host, keyed by host:port. Because this stack has no
+  non-destructive health check — `tls.recv` reports a dead peer the same as a
+  clean end-of-stream — the pool detects a connection the server closed while
+  idle by *using* it: a reused connection that comes back status-0 is closed
+  and the request retried once on a fresh one, so the caller never sees the
+  spurious failure (idempotent requests only). Idle eviction and a per-host
+  cap are lazy (checked on acquire / release, no reaper fiber). `PoolConfig`
+  carries a `Trust` (system store or a private CA). Built entirely on the
+  existing engine — no change to `ffi.tls`. This is the piece `Session`
+  deliberately left to the caller in 0.2.0.
 
 ## 1. Server read timeout
 
@@ -82,14 +93,12 @@ Routing, middleware, and the app model live in the HTTP framework built on
 rongo, not here — rongo delivers `serve` and the request/response pieces; the
 framework orchestrates them.
 
-## 3. HTTP server keep-alive drain + connection pooling (client)
+## 3. HTTP server keep-alive drain
 
-The server-side graceful drain (finish in-flight requests within a
-deadline on shutdown, not just cancel) pairs with the client-side
-connection pool: `Session` reuses one connection today, but the caller
-manages its lifetime by hand — a status-0 means "close and reopen" with no
-automatic detection. A pool (idle eviction, max-per-host) and dead-conn
-marking is the piece `Session` deliberately left to the caller in 0.2.0.
+Graceful server shutdown: on cancel, finish in-flight requests within a
+deadline instead of dropping them the way the nursery does today. The
+client-side pool that used to share this item shipped in 0.6.0; the
+server-side drain is the remaining half.
 
 ## 4. HTTP/2 over TLS (ALPN)
 
@@ -97,7 +106,7 @@ Negotiate `h2` via ALPN in the handshake (`SSL_CTX_set_alpn_protos`) and
 implement HTTP/2 framing + stream multiplexing. The largest item — a real
 protocol, not a wrapper — but it is the "advanced protocols as the
 ecosystem grows" the package README scopes rongo for. Builds on the
-non-blocking transport (0.2.0) and the pool (3).
+non-blocking transport (0.2.0) and the pool (0.6.0).
 
 ## Standing debt (not a feature, but tracked)
 
