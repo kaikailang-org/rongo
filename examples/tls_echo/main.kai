@@ -1,0 +1,77 @@
+#[doc("""
+A TLS echo server and a client talking to it, in one process — 0.3.0's
+server side. The server binds a port with a self-signed cert, accepts one
+connection, and echoes what it reads. The client (rongo's own TLS client)
+connects, sends a line, and prints what comes back. Both run as fibers in
+one nursery, so the accept and the connect overlap on the reactor.
+
+The client uses `connect_insecure` because the cert is self-signed and
+not in any trust store — the point here is to exercise the handshake in
+both directions, not to validate a real chain.
+
+Build & run (from the repo root):
+  make certs && make example-server && ./build/tls_echo
+""")]
+
+import rongo.ffi.tls
+import net.tcp
+import net.http
+import spawn
+
+const PORT : Int = 8443
+
+# Server: accept one client on an already-bound listener, read a chunk,
+# echo it back, close. `listen` runs before the nursery so the port is
+# open before the client fiber connects — no bind/connect race.
+fn serve(l: tls.TlsListener) : Result[String, String] / NetTcp + Ffi =
+  match tls.accept(l) {
+    Err(e) -> { tls.close_listener(l); Err(string_concat("accept: ", e)) }
+    Ok(c)  -> match tls.recv(c, 4096) {
+      Err(e) -> { tls.close(c); tls.close_listener(l); Err(string_concat("recv: ", e)) }
+      Ok(bs) -> {
+        let _ = tls.send(c, bs)               # echo
+        tls.close(c)
+        tls.close_listener(l)
+        Ok(http.bytes_to_string(bs))
+      }
+    }
+  }
+
+# Client: connect (skipping verification for the self-signed cert), send a
+# line, read the echo.
+fn client(msg: String) : Result[String, String] / NetTcp + Ffi =
+  match tls.connect_insecure("127.0.0.1", PORT) {
+    Err(e) -> Err(string_concat("connect: ", e))
+    Ok(c)  -> {
+      let _ = tls.send(c, http.string_to_bytes(msg))
+      let r = match tls.recv(c, 4096) {
+        Err(e) -> Err(string_concat("recv: ", e))
+        Ok(bs) -> Ok(http.bytes_to_string(bs))
+      }
+      tls.close(c)
+      r
+    }
+  }
+
+fn show(label: String, r: Result[String, String]) : Unit / Console = match r {
+  Ok(s)  -> print("#{label}: #{s}")
+  Err(e) -> print("#{label} ERROR: #{e}")
+}
+
+fn main() : Unit / Console + NetTcp + Ffi + Spawn = {
+  # Bind the port up front so it is open before the client connects.
+  match tls.listen("127.0.0.1", PORT, "test-certs/server.crt", "test-certs/server.key") {
+    Err(e) -> print("listen ERROR: #{e}")
+    Ok(l)  -> {
+      let results = nursery { n ->
+        # Server fiber parks on accept; client fiber connects. The reactor
+        # lets both progress without one blocking the other.
+        let srv = n.spawn(() => serve(l))
+        let cli = n.spawn(() => client("hello over tls"))
+        (n.await(srv), n.await(cli))
+      }
+      show("server saw", results.fst)
+      show("client got", results.snd)
+    }
+  }
+}

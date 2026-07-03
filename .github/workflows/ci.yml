@@ -53,3 +53,12 @@ jobs:
           make example-keepalive
           ./build/https_keepalive | tee /tmp/ka.out
           grep -q "1 connection, 1 handshake" /tmp/ka.out
+
+      - name: TLS server — rongo's server and client, one process (no network)
+        timeout-minutes: 1
+        run: |
+          make certs
+          make example-server
+          ./build/tls_echo | tee /tmp/echo.out
+          grep -q "server saw: hello over tls" /tmp/echo.out
+          grep -q "client got: hello over tls" /tmp/echo.out

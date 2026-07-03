@@ -13,16 +13,23 @@ most-wanted first.
   request in flight yields the fiber instead of the thread (two requests
   overlap), and a `Session` reuses one connection across requests
   (Content-Length / chunked framing, no re-handshake).
+- **0.3.0** — TLS server side: `listen` / `accept` serve TLS with a
+  certificate, reusing the same memory-BIO pump (only the handshake
+  direction differs). `listen_mtls` requires and verifies a client
+  certificate against a CA, rejecting a client that presents none. Server
+  and client share one `TlsConn` type, two constructors. The accept loop
+  runs on the reactor, so it can serve concurrent connections under
+  `Spawn`.
 
-## 1. TLS server side + mutual TLS
+## 1. Client certificates + the HTTP server framework
 
-Client-only today. Add `accept`/`listen` over TLS (serve `https://`) and
-client-certificate authentication (mTLS) for both directions:
-`SSL_CTX_use_certificate` / `SSL_CTX_use_PrivateKey` on the server, a
-client cert on `connect` for services that require it. Pairs naturally
-with net.http's existing server-side helpers (`parse_request`,
-`serialize_response`), which rongo can reuse the way `https` reuses the
-client parser.
+Two loose ends from 0.3.0. The **client** can't yet present a certificate,
+so it can't be the client half of an mTLS connection to a server that
+requires one — add a cert/key to `connect`. And the server side today is
+raw TLS (accept + read/write plaintext); an **HTTP server** on top —
+`serve(listener, handler)` reusing net.http's `parse_request` /
+`serialize_response`, with a serve loop and server-side keep-alive — is
+its own release-worth of design.
 
 ## 2. Connection pooling + dead-connection detection
 
