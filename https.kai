@@ -310,6 +310,20 @@ fn exchange(c: tls.TlsConn, u: http.HttpUrl, req: http.Request)
 }
 
 #[doc("""
+Run `req` over an already-open connection `c` and return the parsed
+`Response`. Does NOT open or close `c` — the caller owns its lifetime, so a
+pool can reuse it across requests. `req.url` supplies the path; a parse
+failure or transport error collapses to a status-0 `Response`, matching
+`request`'s contract. This is `session_request` without the `Session`
+wrapper — the piece a connection pool drives.
+""")]
+pub fn exchange_on(c: tls.TlsConn, req: http.Request) : http.Response / NetTcp + Ffi =
+  match parse_url(req.url) {
+    Err(e) -> http.Response { status: 0, headers: [], body: e }
+    Ok(u)  -> exchange(c, u, req)
+  }
+
+#[doc("""
 Issue `req` over a fresh TLS connection and return the parsed `Response`.
 `req.url` must be an absolute `https://` URL. Opens, exchanges, closes —
 one request per connection. For several requests to one host, use
@@ -365,10 +379,7 @@ pub fn open_session_ca(host: String, port: Int, ca_path: String)
 
 #[doc("Issue `req` over the session's persistent connection. `req.url`'s path is used; its host must match the session.")]
 pub fn session_request(s: Session, req: http.Request) : http.Response / NetTcp + Ffi =
-  match parse_url(req.url) {
-    Err(e) -> http.Response { status: 0, headers: [], body: e }
-    Ok(u)  -> exchange(s.conn, u, req)
-  }
+  exchange_on(s.conn, req)
 
 #[doc("GET `url` over the session's persistent connection.")]
 pub fn session_get(s: Session, url: String) : http.Response / NetTcp + Ffi =

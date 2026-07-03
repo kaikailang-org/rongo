@@ -1,0 +1,42 @@
+#[doc("""
+The connection pool — many requests, connections reused and reaped
+automatically.
+
+`open_session` reuses ONE connection you manage by hand; a `Pool` manages
+MANY for you. `pool.get` reuses an idle connection to the host if one is
+fresh, opens one otherwise, and returns it to the pool when done. Two things
+you don't do by hand with a bare `Session`:
+
+- If the server closed a connection while it sat idle, `pool.get` retries on
+  a fresh one transparently — the status you see is never a spurious 0 from a
+  connection that died between requests. (Retry replays the request, so the
+  pool is for idempotent requests.)
+- Connections idle past `max_idle`, or beyond `max_per_host`, are closed for
+  you — no `close_session` per connection.
+
+Here: six GETs to one host through the pool. The first opens a connection;
+the rest reuse it (no re-handshake), except any the server dropped, which the
+pool silently replaces. `close_pool` shuts the rest down at the end.
+
+Build & run (from the repo root):
+  make example-pool && ./build/https_pool
+""")]
+
+import rongo.pool
+import net.http
+
+fn main() : Unit / Console + NetTcp + Ffi + Mutable + Clock = {
+  let p = pool.new_pool(pool.default_pool_config())
+  let urls = ["https://postman-echo.com/get?n=1",
+              "https://postman-echo.com/get?n=2",
+              "https://postman-echo.com/get?n=3",
+              "https://postman-echo.com/get?n=4",
+              "https://postman-echo.com/get?n=5",
+              "https://postman-echo.com/get?n=6"]
+  urls | (url => {
+    let resp = pool.get(p, url)
+    print("#{url} -> #{int_to_string(resp.status)} (#{int_to_string(string_length(resp.body))} bytes)")
+  })
+  pool.close_pool(p)
+  print("6 requests through the pool, connections reused and reaped")
+}
