@@ -10,6 +10,8 @@ Public surface:
     mocking in tests.
   - `rongo.https`    — HTTP/1.1 over TLS (`get` / `post` / `request`),
     the `https://` net.http rejects.
+  - `rongo.pool`     — a client connection pool over `https`: reuses
+    connections per host, retries a dead idle connection transparently.
 
 This entry point is a thin demo. See `examples/` for real usage.
 """)]

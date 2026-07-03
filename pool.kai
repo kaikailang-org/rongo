@@ -1,0 +1,225 @@
+#[doc("""
+A connection pool for the HTTPS client. `import rongo.pool`, reached
+qualified (`pool.get(p, url)`).
+
+`Session` (rongo.https) reuses ONE connection, its lifetime managed by the
+caller. A `Pool` reuses MANY: it keeps idle connections keyed by host:port,
+hands one out per request, and returns it when the request completes. It is
+the piece 0.2.0 deliberately left to the caller.
+
+Two things the pool does that a bare `Session` does not:
+
+- **Transparent retry.** A connection idle in the pool may have been closed
+  by the server (keep-alive timeout). There is no non-destructive health
+  check on this stack — `tls.recv` reports a dead peer the same as a clean
+  end-of-stream (`Ok([])`), so the only way to learn a connection died is to
+  use it. So `request` uses a pooled connection, and if the exchange comes
+  back status-0 (transport failure), it closes that connection and retries
+  ONCE on a fresh one. The caller never sees the spurious failure of a
+  connection that died while idle. This retry replays the request, so it is
+  only safe for idempotent requests — do not pool non-idempotent POSTs whose
+  replay would double-execute.
+
+- **Idle eviction.** A connection idle longer than `max_idle` is closed
+  instead of reused; a host holding `max_per_host` idle connections closes
+  the next returned one instead of growing without bound. Eviction is lazy
+  (checked on acquire / release), so no reaper fiber runs — an unused pool
+  keeps its connections until the next request touches it, then prunes.
+
+Concurrency: acquire and release are pure `Mutable` sequences with no yield
+points between the `ref_get` and the `ref_set`, so on this cooperative
+single-thread scheduler no two fibers can take the same connection. The I/O
+(connect / close / the exchange) happens OUTSIDE that section, on the
+caller's fiber — the pool never holds the critical section across a network
+op.
+""")]
+
+import net.http
+import rongo.https
+import rongo.ffi.tls
+import time
+
+#[doc("""
+How the pool verifies the servers it connects to. `System` checks the chain
+against the OS trust store (public servers); `PrivateCA(path)` trusts the CA
+at `path` instead (an internal / dev / staging server with an org or
+self-signed cert). One pool, one trust policy — a pool serves a set of hosts
+under the same trust root.
+""")]
+pub type Trust = System | PrivateCA(String)
+
+#[doc("""
+Pool limits and trust. `max_per_host` bounds idle connections kept per
+host:port (a returned connection past the cap is closed, not stored);
+`max_idle` is how long an idle connection may sit before it is closed rather
+than reused; `trust` is how server certificates are verified.
+""")]
+pub type PoolConfig = {
+  max_per_host: Int,
+  max_idle: Duration,
+  trust: Trust,
+}
+
+#[doc("Sensible defaults: 8 idle connections per host, 90s idle timeout, system trust store.")]
+pub fn default_pool_config() : PoolConfig = PoolConfig {
+  max_per_host: 8,
+  max_idle: seconds(90),
+  trust: System,
+}
+
+# One idle connection: the handle, its host:port (so the pool can match a
+# request to a reusable connection), and the instant it returned to the pool
+# (so eviction can measure how long it has sat). `pub` so the pure eviction
+# policy (`evict_expired`) can be exercised by tests.
+pub type Idle = { conn: tls.TlsConn, host: String, port: Int, since: Instant }
+
+#[doc("""
+A connection pool. Open one with `new_pool`, issue requests with `get` /
+`request` (each reuses an idle connection to the target host:port or opens a
+fresh one), and `close_pool` to shut every idle connection down. Share one
+`Pool` across the fibers that talk to the same set of hosts.
+""")]
+pub type Pool = { priv idle: Ref[[Idle]], priv cfg: PoolConfig }
+
+#[doc("Open an empty pool with the given limits. Use `default_pool_config()` for defaults.")]
+pub fn new_pool(cfg: PoolConfig) : Pool / Mutable =
+  Pool { idle: Mutable.ref_make([]), cfg: cfg }
+
+# ---- pure eviction policy (tested without network) ----------------
+#
+# These decide, over the idle list, what to keep vs. drop. They touch no
+# connection and no effect, so tests exercise them with fabricated Instants.
+
+#[doc("""
+Is a connection idle since `since` still fresh at `now` — i.e. has it sat
+for less than `max_idle`? The eviction predicate, pure over instants (no
+connection, no effect), so tests drive it with fabricated `Instant`s.
+""")]
+pub fn is_fresh(since: Instant, now: Instant, max_idle: Duration) : Bool =
+  duration_lt(elapsed_since(since, now), max_idle)
+
+# Split `xs` into (still-fresh, expired) by idle age. `fst` is kept, `snd`
+# is closed by the caller — the policy itself touches no connection.
+fn evict_expired(xs: [Idle], now: Instant, max_idle: Duration) : Pair[[Idle], [Idle]] =
+  list.partition(xs, (e) => is_fresh(e.since, now, max_idle))
+
+#[doc("Whether a host already at `count` idle connections has room for one more, given the cap.")]
+pub fn should_keep(count: Int, cfg: PoolConfig) : Bool = count < cfg.max_per_host
+
+# Does an idle entry target this host:port?
+fn for_host(e: Idle, host: String, port: Int) : Bool =
+  e.host == host and e.port == port
+
+# ---- acquire / release (critical section: no yield points) --------
+#
+# monotonic() is read BEFORE entering, since it is a Clock op (a yield); the
+# ref_get / ref_set pair that follows has no yield between them.
+
+# Take a fresh idle connection to host:port out of the pool, if one exists.
+# Expired connections for ANY host are pruned out of the stored list here and
+# returned in `snd` for the caller to close (outside the critical section).
+fn acquire(p: Pool, host: String, port: Int, now: Instant)
+    : Pair[Option[tls.TlsConn], [Idle]] / Mutable = {
+  let all = Mutable.ref_get(p.idle)
+  let split = evict_expired(all, now, p.cfg.max_idle)   # fresh vs. expired
+  let fresh = split.fst
+  let expired = split.snd
+  # Of the fresh ones, pull the first for this host:port; keep the rest.
+  let byhost = list.partition(fresh, (e) => for_host(e, host, port))
+  match byhost.fst {
+    [] -> { Mutable.ref_set(p.idle, fresh); Pair { fst: None, snd: expired } }
+    [take, ...rest] -> {
+      # Store: the other hosts' fresh + this host's leftovers. Expired dropped.
+      Mutable.ref_set(p.idle, list_append(byhost.snd, rest))
+      Pair { fst: Some(take.conn), snd: expired }
+    }
+  }
+}
+
+# Return `c` to the pool for host:port, unless this host is already at the
+# cap — in which case the caller must close it (returned as `False`). The
+# `since` stamp is `now`.
+fn release(p: Pool, host: String, port: Int, c: tls.TlsConn, now: Instant)
+    : Bool / Mutable = {
+  let all = Mutable.ref_get(p.idle)
+  let n = list.length(list.filter(all, (e) => for_host(e, host, port)))
+  if should_keep(n, p.cfg) {
+    Mutable.ref_set(p.idle, [Idle { conn: c, host: host, port: port, since: now }, ...all])
+    true
+  } else { false }
+}
+
+# ---- request path -------------------------------------------------
+
+#[doc("""
+Issue `req` through the pool. `req.url` must be an absolute `https://` URL.
+Reuses an idle connection to the target host:port if one is available and
+fresh, else opens a new one; on transport failure over a reused connection,
+retries ONCE on a fresh connection (see the module doc — idempotent requests
+only). Returns the parsed `Response`, or a status-0 `Response` carrying the
+error if even a fresh connection fails.
+""")]
+pub fn request(p: Pool, req: http.Request) : http.Response / NetTcp + Ffi + Mutable + Clock =
+  match https.parse_url(req.url) {
+    Err(e) -> http.Response { status: 0, headers: [], body: e }
+    Ok(u)  -> {
+      let now = monotonic()
+      let acq = acquire(p, u.host, u.port, now)
+      close_all(acq.snd)                       # close pruned-expired, outside the lock
+      match acq.fst {
+        # Reuse: try it; a status-0 means the connection died idle — retry fresh.
+        Some(c) -> {
+          let resp = https.exchange_on(c, req)
+          if resp.status == 0 { tls.close(c); fresh_request(p, u, req) }
+          else { keep(p, u, c); resp }
+        }
+        None -> fresh_request(p, u, req)
+      }
+    }
+  }
+
+#[doc("GET `url` through the pool. Sugar over `request` with a bare GET.")]
+pub fn get(p: Pool, url: String) : http.Response / NetTcp + Ffi + Mutable + Clock =
+  request(p, http.Request { method: "GET", url: url, headers: [], body: "" })
+
+# Open a connection under the pool's trust policy.
+fn dial(cfg: PoolConfig, host: String, port: Int)
+    : Result[String, tls.TlsConn] / NetTcp + Ffi = match cfg.trust {
+  System         -> tls.connect(host, port)
+  PrivateCA(ca)  -> tls.connect_ca(host, port, ca)
+}
+
+# Open a fresh connection, run the exchange, and return the connection to the
+# pool on success. A connect failure or a second transport failure surfaces
+# as a status-0 Response — no further retry.
+fn fresh_request(p: Pool, u: http.HttpUrl, req: http.Request)
+    : http.Response / NetTcp + Ffi + Mutable + Clock =
+  match dial(p.cfg, u.host, u.port) {
+    Err(e) -> http.Response { status: 0, headers: [], body: string_concat("connect: ", e) }
+    Ok(c)  -> {
+      let resp = https.exchange_on(c, req)
+      if resp.status == 0 { tls.close(c) }     # fresh one also failed: drop it
+      else { keep(p, u, c) }
+      resp
+    }
+  }
+
+# Return `c` to the pool, closing it if the host is at capacity.
+fn keep(p: Pool, u: http.HttpUrl, c: tls.TlsConn) : Unit / NetTcp + Ffi + Mutable + Clock = {
+  let now = monotonic()
+  if release(p, u.host, u.port, c, now) { () } else { tls.close(c) }
+}
+
+# ---- shutdown -----------------------------------------------------
+
+#[doc("Close every idle connection the pool holds. Call when done with the pool.")]
+pub fn close_pool(p: Pool) : Unit / NetTcp + Ffi + Mutable = {
+  let all = Mutable.ref_get(p.idle)
+  Mutable.ref_set(p.idle, [])
+  close_all(all)
+}
+
+fn close_all(xs: [Idle]) : Unit / NetTcp + Ffi = match xs {
+  [] -> ()
+  [e, ...rest] -> { tls.close(e.conn); close_all(rest) }
+}
