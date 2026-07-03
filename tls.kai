@@ -1,0 +1,48 @@
+#[doc("""
+The `Tls` effect + `tls_wrap` — the handler-based surface over the flat
+engine in `rongo.ffi.tls`. `import rongo.tls`.
+
+Why an effect on top of the flat API: it makes a TLS-using program
+mockable. Production wraps the body in `tls_wrap`, whose handler
+delegates each op to the real OpenSSL engine. A test wraps the SAME body
+in its own `handle ... with Tls { ... }` that returns canned bytes — no
+network, no OpenSSL, deterministic. This mirrors how the stdlib lets a
+test swap a real effect handler for a recording one.
+
+Unlike the builtin `NetTcp`, `Tls` has NO default handler: a user
+package cannot register a runtime default (those bridge to compiler-owned
+`kai_default_*` symbols). So a `Tls` op is only reachable inside a
+`tls_wrap` (or a test handler) — the wrap is mandatory, by construction.
+""")]
+
+import rongo.ffi.tls
+
+#[doc("""
+The TLS capability, shaped like `NetTcp`: `connect` opens a verified
+handle, `send` / `recv` move `[Int]` byte lists, `close` releases it.
+Reuses `tls.TlsConn` as the handle type so the effect and the flat API
+speak the same values.
+""")]
+pub effect Tls {
+  connect(host: String, port: Int) : Result[String, tls.TlsConn]
+  send(c: tls.TlsConn, data: [Int]) : Result[String, Int]
+  recv(c: tls.TlsConn, max: Int) : Result[String, [Int]]
+  close(c: tls.TlsConn) : Unit
+}
+
+#[doc("""
+Run `body` with the real OpenSSL engine installed as the `Tls` handler.
+Each op resumes with the result of the corresponding `rongo.ffi.tls`
+call, so `body` performs `Tls.connect(...)` etc. against live TLS.
+
+The handler carries `/ Ffi` because it delegates to the FFI engine; that
+row propagates to `tls_wrap`'s own signature. Tests that install their
+own handler instead of `tls_wrap` need no `Ffi`.
+""")]
+pub fn tls_wrap[a](body: () -> a / Tls + Ffi) : a / Ffi =
+  handle { body() } with Tls {
+    connect(host, port, resume) -> resume(tls.connect(host, port))
+    send(c, data, resume)       -> resume(tls.send(c, data))
+    recv(c, max, resume)        -> resume(tls.recv(c, max))
+    close(c, resume)            -> resume(tls.close(c))
+  }

@@ -1,0 +1,4 @@
+[package]
+name = "rongo"
+version = "0.1.0"
+entry = "rongo.kai"
