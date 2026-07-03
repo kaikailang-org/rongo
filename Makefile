@@ -33,9 +33,24 @@ SHIM := ffi/tls_openssl.c
 
 KAI_CFLAGS := -std=c99 -O2 -Wall $(OPENSSL_CFLAGS) $(SHIM) $(OPENSSL_LIBS)
 
-.PHONY: all demo test example clean check-openssl
+.PHONY: all demo test example example-post example-concurrent example-keepalive \
+        example-server certs clean check-openssl
+
+# The `openssl` CLI from the same install pkg-config resolves.
+OPENSSL_BIN := $(shell $(PKG_ENV) pkg-config --variable=prefix openssl)/bin/openssl
 
 all: build/rongo
+
+# Self-signed dev cert for the TLS server example (CN=localhost, with SAN
+# for localhost + 127.0.0.1). Dev only — never a real key. Gitignored.
+certs: test-certs/server.crt
+
+test-certs/server.crt:
+	mkdir -p test-certs
+	$(OPENSSL_BIN) req -x509 -newkey rsa:2048 -nodes \
+	  -keyout test-certs/server.key -out test-certs/server.crt \
+	  -days 3650 -subj "/CN=localhost" \
+	  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 
 # The entry-point demo (rongo.kai) — a live https.get.
 demo: build/rongo
@@ -78,6 +93,12 @@ build/https_concurrent: examples/https_concurrent/main.kai $(LIB_SRCS) | build
 example-keepalive: build/https_keepalive
 build/https_keepalive: examples/https_keepalive/main.kai $(LIB_SRCS) | build
 	$(call build_example,examples/https_keepalive/main.kai,$@)
+
+# The 0.3.0 gate: a TLS server and rongo's own client, echo end to end.
+# Needs the dev cert (`make certs`).
+example-server: build/tls_echo
+build/tls_echo: examples/tls_echo/main.kai $(LIB_SRCS) | build
+	$(call build_example,examples/tls_echo/main.kai,$@)
 
 # Package tests: pure parsers + the effect mock (no network) run under
 # `kai test`; the shim is linked so the FFI externs resolve.

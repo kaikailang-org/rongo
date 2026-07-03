@@ -43,6 +43,12 @@ extern "C"("kai_tls_step")          fn raw_step(slot: Int) : Int / Ffi
 extern "C"("kai_tls_write")         fn raw_write(slot: Int, data: String, len: Int) : Int / Ffi
 extern "C"("kai_tls_read")          fn raw_read(slot: Int, max: Int) : String / Ffi
 extern "C"("kai_tls_shutdown")      fn raw_shutdown(slot: Int) : Unit / Ffi
+# Server side: a listener owns the server ctx (cert+key loaded once);
+# accept mints a connection slot over it, in accept state.
+extern "C"("kai_tls_listener_new")      fn raw_listener_new(cert: String, key: String) : Int / Ffi
+extern "C"("kai_tls_listener_new_mtls") fn raw_listener_new_mtls(cert: String, key: String, ca: String) : Int / Ffi
+extern "C"("kai_tls_listener_free")     fn raw_listener_free(listener: Int) : Unit / Ffi
+extern "C"("kai_tls_accept")            fn raw_accept(listener: Int) : Int / Ffi
 
 # Shim status codes (mirror the #defines in ffi/tls_openssl.c).
 const TLS_OK         : Int = 0
@@ -190,3 +196,79 @@ pub fn close(c: TlsConn) : Unit / NetTcp + Ffi = {
   NetTcp.close(c.conn)
   raw_free(c.slot)
 }
+
+# ---- server side --------------------------------------------------
+#
+# A TlsListener binds a TCP port and owns the server SSL_CTX (cert + key
+# loaded once). `accept` runs the SAME memory-BIO pump as the client, only
+# the handshake direction differs (SSL_accept, set in the shim). An
+# accepted connection is a plain TlsConn — one type, two constructors, as
+# in Go's tls.Conn.
+
+#[doc("""
+A TLS server listener: a bound TCP port plus the server certificate.
+`slot` indexes the shim's listener table (the SSL_CTX). Close it with
+`close_listener`; accepted connections are independent and outlive it.
+""")]
+pub type TlsListener = { priv tcp_l: tcp.Listener, priv slot: Int }
+
+fn listener_error(code: Int) : String = match code {
+  -10 -> "tls: listener table full"
+  -11 -> "tls: server context allocation failed"
+  -12 -> "tls: certificate/CA load failed"
+  -13 -> "tls: private key load failed or mismatched"
+  _   -> "tls: listener error (code #{int_to_string(code)})"
+}
+
+fn listen_impl(host: String, port: Int, lslot: Int) : Result[String, TlsListener] / NetTcp + Ffi =
+  if lslot < 0 { Err(listener_error(lslot)) }
+  else { match NetTcp.listen(host, port) {
+    Err(e) -> { raw_listener_free(lslot); Err(string_concat("tls: listen: ", e)) }
+    Ok(l)  -> Ok(TlsListener { tcp_l: l, slot: lslot })
+  } }
+
+#[doc("""
+Bind `host:port` and serve TLS with the certificate chain at `cert_path`
+and private key at `key_path` (both PEM). Returns a listener to `accept`
+on.
+""")]
+pub fn listen(host: String, port: Int, cert_path: String, key_path: String)
+    : Result[String, TlsListener] / NetTcp + Ffi =
+  listen_impl(host, port, raw_listener_new(cert_path, key_path))
+
+#[doc("""
+Like `listen`, but require and verify a client certificate (mutual TLS):
+a connecting client must present a cert signed by the CA at `ca_path`, or
+the handshake fails. This is the server-side dual of certificate
+verification — a client with no cert is rejected, not admitted.
+""")]
+pub fn listen_mtls(host: String, port: Int, cert_path: String, key_path: String, ca_path: String)
+    : Result[String, TlsListener] / NetTcp + Ffi =
+  listen_impl(host, port, raw_listener_new_mtls(cert_path, key_path, ca_path))
+
+#[doc("""
+Accept one connection: wait for a client, run the TLS handshake (and, for
+an mTLS listener, verify the client cert), and return an established
+`TlsConn`. Blocks the fiber — not the thread — until a client arrives, so
+an accept loop can run under `Spawn`.
+""")]
+pub fn accept(l: TlsListener) : Result[String, TlsConn] / NetTcp + Ffi =
+  match NetTcp.accept(l.tcp_l) {
+    Err(e) -> Err(string_concat("tls: accept: ", e))
+    Ok(c)  -> {
+      let slot = raw_accept(l.slot)
+      if slot < 0 { NetTcp.close(c); Err("tls: accept SSL init failed") }
+      else { match handshake(c, slot) {
+        Err(e) -> { raw_free(slot); NetTcp.close(c); Err(e) }
+        Ok(_)  -> Ok(TlsConn { conn: c, slot: slot })
+      } }
+    }
+  }
+
+#[doc("""
+Release a listener's server context. Accepted connections are
+independent and unaffected. The bound TCP port itself is held by the
+runtime's `NetTcp` listener, which exposes no explicit close in v1 — it
+is released when the process exits.
+""")]
+pub fn close_listener(l: TlsListener) : Unit / Ffi = raw_listener_free(l.slot)

@@ -56,7 +56,6 @@ typedef struct {
   BIO  *rbio;        /* ciphertext IN  — we BIO_write, OpenSSL reads  */
   BIO  *wbio;        /* ciphertext OUT — OpenSSL writes, we BIO_read  */
   int   in_use;
-  int   insecure;    /* per-connection, not a global */
   /* Scratch for hex conversion, sized for one drain/read. Per-connection
    * so a fiber yield mid-pump cannot let another conn overwrite it. */
   char *hexbuf;
@@ -77,6 +76,105 @@ static SSL_CTX *kai_tls_ctx(void) {
   SSL_CTX_set_default_verify_paths(ctx);
   client_ctx = ctx;
   return ctx;
+}
+
+/* ---- server listeners --------------------------------------------
+ *
+ * A listener owns a server SSL_CTX with the cert + key loaded ONCE, and
+ * every accepted connection makes a fresh SSL over that shared ctx. The
+ * ctx is shared across all accepted fibers without a lock: the scheduler
+ * is a single OS thread (fibers, not threads), so two fibers are never
+ * inside OpenSSL at the same instant. */
+
+#define KAI_TLS_MAX_LISTENERS 16
+
+/* Listener errors, distinct from connection errors. */
+#define KAI_TLS_ERR_LISTENER_FULL (-10)
+#define KAI_TLS_ERR_CTX           (-11)
+#define KAI_TLS_ERR_CERT          (-12)
+#define KAI_TLS_ERR_KEY           (-13)
+
+typedef struct {
+  SSL_CTX *ctx;
+  int      in_use;
+} kai_tls_listener;
+
+static kai_tls_listener listeners[KAI_TLS_MAX_LISTENERS];
+
+static int listener_alloc(void) {
+  for (int i = 0; i < KAI_TLS_MAX_LISTENERS; i++) {
+    if (!listeners[i].in_use) { return i; }
+  }
+  return -1;
+}
+
+static int listener_ok(int64_t s) {
+  int i = (int)s;
+  return i >= 0 && i < KAI_TLS_MAX_LISTENERS && listeners[i].in_use;
+}
+
+/* Build a server ctx with cert + key loaded. When `ca_file` is non-NULL,
+ * require and verify a client certificate (mTLS). Returns a listener
+ * slot, or a negative KAI_TLS_ERR_* code. */
+static int64_t listener_new(const char *cert_file, const char *key_file,
+                            const char *ca_file) {
+  int idx = listener_alloc();
+  if (idx < 0) { return KAI_TLS_ERR_LISTENER_FULL; }
+
+  const SSL_METHOD *method = TLS_server_method();
+  if (method == NULL) { return KAI_TLS_ERR_CTX; }
+  SSL_CTX *ctx = SSL_CTX_new(method);
+  if (ctx == NULL) { return KAI_TLS_ERR_CTX; }
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+  if (SSL_CTX_use_certificate_chain_file(ctx, cert_file) != 1) {
+    SSL_CTX_free(ctx); return KAI_TLS_ERR_CERT;
+  }
+  if (SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) != 1) {
+    SSL_CTX_free(ctx); return KAI_TLS_ERR_KEY;
+  }
+  if (SSL_CTX_check_private_key(ctx) != 1) {
+    SSL_CTX_free(ctx); return KAI_TLS_ERR_KEY;
+  }
+
+  if (ca_file != NULL) {
+    /* mTLS: load the trusted CA and REQUIRE a valid client cert.
+     * VERIFY_PEER alone would accept a client that sends none —
+     * FAIL_IF_NO_PEER_CERT closes that hole. The callback MUST stay NULL:
+     * OpenSSL's default aborts the handshake on any verification failure
+     * (bad chain, expired, untrusted CA). A custom callback that returns
+     * 1 would silently admit invalid certs — the rejection depends on
+     * this default. */
+    if (SSL_CTX_load_verify_file(ctx, ca_file) != 1) {
+      SSL_CTX_free(ctx); return KAI_TLS_ERR_CERT;
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+  }
+
+  listeners[idx].ctx    = ctx;
+  listeners[idx].in_use = 1;
+  return (int64_t)idx;
+}
+
+/* Bind a plain-TLS server listener (no client-cert requirement). */
+int64_t kai_tls_listener_new(const char *cert_file, const char *key_file) {
+  return listener_new(cert_file, key_file, NULL);
+}
+
+/* Bind an mTLS listener that requires a client cert signed by `ca_file`. */
+int64_t kai_tls_listener_new_mtls(const char *cert_file, const char *key_file,
+                                  const char *ca_file) {
+  return listener_new(cert_file, key_file, ca_file);
+}
+
+/* Free a listener's ctx and slot. Accepted connections are independent
+ * (their own SSL objects) and outlive this. */
+void kai_tls_listener_free(int64_t listener) {
+  if (!listener_ok(listener)) { return; }
+  int i = (int)listener;
+  SSL_CTX_free(listeners[i].ctx);
+  listeners[i].ctx    = NULL;
+  listeners[i].in_use = 0;
 }
 
 static int slot_alloc(void) {
@@ -120,6 +218,28 @@ static int hex_val(char c) {
 
 /* ---- lifecycle ---------------------------------------------------- */
 
+/* Wire `ssl` to a fresh pair of memory BIOs and park it in slot `idx`.
+ * Returns 0 on success, KAI_TLS_ERR_SSL on allocation failure (and frees
+ * `ssl` in that case). Shared by the client and server constructors. */
+static int wire_slot(int idx, SSL *ssl) {
+  BIO *rbio = BIO_new(BIO_s_mem());
+  BIO *wbio = BIO_new(BIO_s_mem());
+  if (rbio == NULL || wbio == NULL) {
+    if (rbio) { BIO_free(rbio); }
+    if (wbio) { BIO_free(wbio); }
+    SSL_free(ssl);
+    return KAI_TLS_ERR_SSL;
+  }
+  SSL_set_bio(ssl, rbio, wbio);   /* SSL_free will free both BIOs */
+  slots[idx].ssl    = ssl;
+  slots[idx].rbio   = rbio;
+  slots[idx].wbio   = wbio;
+  slots[idx].in_use = 1;
+  slots[idx].hexbuf = NULL;
+  slots[idx].hexcap = 0;
+  return 0;
+}
+
 /* Create an SSL client object wired to a fresh pair of memory BIOs, set
  * up SNI + verification, and start the handshake state machine. Returns
  * a slot, or a negative error. `host` drives SNI and hostname
@@ -134,32 +254,38 @@ int64_t kai_tls_new(const char *host, int64_t insecure) {
   SSL *ssl = SSL_new(ctx);
   if (ssl == NULL) { return KAI_TLS_ERR_SSL; }
 
-  BIO *rbio = BIO_new(BIO_s_mem());
-  BIO *wbio = BIO_new(BIO_s_mem());
-  if (rbio == NULL || wbio == NULL) {
-    if (rbio) { BIO_free(rbio); }
-    if (wbio) { BIO_free(wbio); }
-    SSL_free(ssl);
-    return KAI_TLS_ERR_SSL;
-  }
-  /* SSL_set_bio takes ownership of both BIOs (freed by SSL_free). */
-  SSL_set_bio(ssl, rbio, wbio);
-
   if (!insecure) {
     SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
     if (KAI_TLS_SET_HOST(ssl, host) != 1) { SSL_free(ssl); return KAI_TLS_ERR_SSL; }
+    /* Callback MUST stay NULL: OpenSSL's default fails the handshake on a
+     * bad chain / hostname / expiry. A callback returning 1 would defeat
+     * verification silently — the security of connect() rests on it. */
     SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
   }
   SSL_set_tlsext_host_name(ssl, host);   /* SNI */
-  SSL_set_connect_state(ssl);            /* we are the client */
 
-  slots[idx].ssl      = ssl;
-  slots[idx].rbio     = rbio;
-  slots[idx].wbio     = wbio;
-  slots[idx].in_use   = 1;
-  slots[idx].insecure = insecure ? 1 : 0;
-  slots[idx].hexbuf   = NULL;
-  slots[idx].hexcap   = 0;
+  int rc = wire_slot(idx, ssl);
+  if (rc != 0) { return rc; }
+  SSL_set_connect_state(slots[idx].ssl);   /* we are the client */
+  return (int64_t)idx;
+}
+
+/* Accept a new server-side connection over `listener`'s ctx: a fresh SSL
+ * on the shared server ctx, wired to memory BIOs, in accept state. The
+ * driver then pumps SSL_accept via tls_step. Verification (mTLS) is baked
+ * into the ctx, so nothing per-connection is needed here. Returns a
+ * connection slot, or a negative error. */
+int64_t kai_tls_accept(int64_t listener) {
+  if (!listener_ok(listener)) { return KAI_TLS_ERR_SLOT; }
+  int idx = slot_alloc();
+  if (idx < 0) { return KAI_TLS_ERR_SLOT; }
+
+  SSL *ssl = SSL_new(listeners[(int)listener].ctx);
+  if (ssl == NULL) { return KAI_TLS_ERR_SSL; }
+
+  int rc = wire_slot(idx, ssl);
+  if (rc != 0) { return rc; }
+  SSL_set_accept_state(slots[idx].ssl);    /* we are the server */
   return (int64_t)idx;
 }
 

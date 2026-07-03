@@ -32,21 +32,23 @@ advanced networking (system-dependency-carrying) here.
 
 ## Status
 
-The TLS lane works: `https://` end to end, over OpenSSL, with mandatory
-certificate verification — non-blocking and with keep-alive. TLS runs
-over kaikai's reactor-aware `NetTcp`, so a request in flight yields the
-fiber instead of freezing the thread; two requests overlap, and a
-`Session` reuses one connection across requests. What comes after — TLS
-server side, HTTP/2 — is in [ROADMAP.md](ROADMAP.md).
+The TLS lane works both ways: `https://` client end to end, and a TLS
+server — over OpenSSL, non-blocking, with keep-alive and mutual TLS. TLS
+runs over kaikai's reactor-aware `NetTcp`, so a request in flight yields
+the fiber instead of freezing the thread; two requests overlap, a
+`Session` reuses one connection across requests, and an accept loop serves
+concurrent connections. What comes after — an HTTP server, HTTP/2 — is in
+[ROADMAP.md](ROADMAP.md).
 
 The architecture is the Rustls / Go `crypto/tls` split: OpenSSL runs the
 TLS state machine over memory BIOs and never touches a socket; `NetTcp`
 moves the ciphertext. The module layout:
 
-- **`rongo.ffi.tls`** — the flat TLS engine: `connect`, `send`, `recv`,
-  `close`, returning `Result[String, _]`, over the `TlsConn` handle.
-  `connect` runs the whole handshake — DNS, TCP, TLS ≥ 1.2, SNI, chain +
-  hostname verification.
+- **`rongo.ffi.tls`** — the flat TLS engine. Client: `connect`, `send`,
+  `recv`, `close` over the `TlsConn` handle, with the whole handshake
+  (DNS, TCP, TLS ≥ 1.2, SNI, chain + hostname verification). Server:
+  `listen` / `listen_mtls` bind a port with a certificate, `accept`
+  returns a `TlsConn` — same type, same pump, mirrored handshake.
 - **`rongo.tls`** — the `Tls` effect + `tls_wrap`. The effect ops carry
   pure data (`write` / `read` / `close`, no handle); the connection is
   the handler. A program can be tested against a mock handler with no
@@ -86,8 +88,24 @@ match https.open_session("example.com", 443) {
 }
 ```
 
+A TLS server (`tls.listen_mtls` is the same, plus a CA to verify clients):
+
+```kaikai
+match tls.listen("127.0.0.1", 8443, "server.crt", "server.key") {
+  Ok(l) -> match tls.accept(l) {          # parks the fiber until a client arrives
+    Ok(c) -> {
+      let msg = tls.recv(c, 4096)
+      # ... handle, then tls.send(c, reply) ...
+      tls.close(c)
+    }
+    Err(e) -> print(e)
+  }
+  Err(e) -> print(e)
+}
+```
+
 See `examples/` for runnable versions (`https_get`, `https_post`,
-`https_concurrent`, `https_keepalive`).
+`https_concurrent`, `https_keepalive`, `tls_echo`).
 
 ## Build
 
@@ -101,6 +119,8 @@ make example            # examples/https_get         (live GET)
 make example-post       # examples/https_post        (live POST, large body)
 make example-concurrent # examples/https_concurrent  (two overlapping requests)
 make example-keepalive  # examples/https_keepalive   (3 requests, 1 connection)
+make certs              # self-signed dev cert for the server example
+make example-server     # examples/tls_echo          (TLS server + client, one process)
 make test               # tests (pure parsers + effect mock, no network)
 ```
 
@@ -108,8 +128,9 @@ make test               # tests (pure parsers + effect mock, no network)
 mock handler — the runner installs no `Ffi` capability, so a test block
 cannot drive the real OpenSSL path. That path is exercised by the
 runnable examples: `https_post`'s >16 KB body spans several TLS records,
-`https_concurrent` proves one request does not block another, and
-`https_keepalive` proves a connection is reused across requests.
+`https_concurrent` proves one request does not block another,
+`https_keepalive` proves a connection is reused across requests, and
+`tls_echo` runs rongo's own server and client against each other.
 
 Requires OpenSSL 3.x / 4.x or LibreSSL (the shim uses only the stable
 high-level API; hostname verification binds `SSL_set1_dnsname` on 4.0,
