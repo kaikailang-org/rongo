@@ -43,29 +43,41 @@ demo: build/rongo
 build/rongo: rongo.kai https.kai tls.kai ffi/tls.kai $(SHIM) | build
 	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) build . -o $@
 
-# The https_get example lives in examples/ but is built as part of the
-# rongo package so its `import rongo.*` resolves. An example with its own
-# kai.toml depending on `../..` hits kaikai 0.98's path-dep resolver on a
-# package that contains its own consumer, which fails; the entry-override
-# in kai.toml is the only override kai build accepts, so we swap the
-# manifest for the build and restore it after.
+# Examples live under examples/ but build as part of the rongo package so
+# their `import rongo.*` resolves. An example with its own kai.toml
+# depending on `../..` hits kaikai 0.98's path-dep resolver on a package
+# that contains its own consumer, which fails; the `entry` field in
+# kai.toml is the only override kai build accepts, so build_example swaps
+# the manifest for the build and restores it after.
+#
+# build_example: $1 = entry .kai path, $2 = output binary.
+LIB_SRCS := https.kai tls.kai ffi/tls.kai $(SHIM)
+
+define build_example
+	cp kai.toml kai.toml.bak
+	sed 's#^entry = .*#entry = "$(1)"#' kai.toml.bak > kai.toml
+	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) build . -o $(2) ; \
+	  status=$$? ; mv kai.toml.bak kai.toml ; exit $$status
+endef
+
 example: build/https_get
+build/https_get: examples/https_get/main.kai $(LIB_SRCS) | build
+	$(call build_example,examples/https_get/main.kai,$@)
 
-build/https_get: examples/https_get/main.kai https.kai tls.kai ffi/tls.kai $(SHIM) | build
-	cp kai.toml kai.toml.bak
-	printf '[package]\nname = "rongo"\nversion = "0.1.0"\nentry = "examples/https_get/main.kai"\n' > kai.toml
-	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) build . -o $@ ; \
-	  status=$$? ; mv kai.toml.bak kai.toml ; exit $$status
-
-# The https_post example is the live integration check for send_all's
-# partial-write loop (a >16 KB POST body). Same entry-override build.
+# Live integration check for the send path over a >16 KB POST body.
 example-post: build/https_post
+build/https_post: examples/https_post/main.kai $(LIB_SRCS) | build
+	$(call build_example,examples/https_post/main.kai,$@)
 
-build/https_post: examples/https_post/main.kai https.kai tls.kai ffi/tls.kai $(SHIM) | build
-	cp kai.toml kai.toml.bak
-	printf '[package]\nname = "rongo"\nversion = "0.1.0"\nentry = "examples/https_post/main.kai"\n' > kai.toml
-	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) build . -o $@ ; \
-	  status=$$? ; mv kai.toml.bak kai.toml ; exit $$status
+# The 0.2.0 gate: two concurrent HTTPS requests, one must not block the other.
+example-concurrent: build/https_concurrent
+build/https_concurrent: examples/https_concurrent/main.kai $(LIB_SRCS) | build
+	$(call build_example,examples/https_concurrent/main.kai,$@)
+
+# Keep-alive: three requests over one persistent connection.
+example-keepalive: build/https_keepalive
+build/https_keepalive: examples/https_keepalive/main.kai $(LIB_SRCS) | build
+	$(call build_example,examples/https_keepalive/main.kai,$@)
 
 # Package tests: pure parsers + the effect mock (no network) run under
 # `kai test`; the shim is linked so the FFI externs resolve.

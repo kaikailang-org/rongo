@@ -19,7 +19,7 @@ fn show_header(name: String, resp: http.Response) : Unit / Console =
     None    -> ()
   }
 
-fn main() : Unit / Console + Ffi = {
+fn main() : Unit / Console + NetTcp + Ffi = {
   let url = "https://example.com/"
   print("GET #{url}")
   let resp = https.get(url)

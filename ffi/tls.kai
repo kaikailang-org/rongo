@@ -1,206 +1,192 @@
 #[doc("""
-Base TLS layer — the flat FFI engine over OpenSSL. `import rongo.ffi.tls`.
+Base TLS layer — OpenSSL's TLS state machine over kaikai's NetTcp.
+`import rongo.ffi.tls`.
 
-This is the always-available motor: plain `extern "C"` calls into the
-`ffi/tls_openssl.c` slot-table shim, wrapped in `Result[String, _]` so
-the surface reads like `NetTcp`. The optional `effect Tls` (in the
-parent `tls` module) delegates here; tests mock the effect, production
-runs this.
+OpenSSL runs over memory BIOs and never touches a socket; this driver
+shuttles the ciphertext between those BIOs and `NetTcp` (which is
+reactor-aware, so a TLS op yields the fiber instead of blocking the
+thread). The split — TLS state machine in the shim, byte transport in
+kaikai — is the Rustls / Go crypto.tls / Erlang ssl architecture.
 
-Bytes are `[Int]` (each element in `[0, 255]`), matching `NetTcp` and
-`net.http`. They cross the FFI boundary as a `String`: kaikai's FFI
-delivers a `String` param as a raw byte pointer valid for its full
-length across embedded NUL, so `send` carries binary losslessly with an
-explicit length. `recv` comes back hex-encoded (a returned `String` is
-repacked strlen-based, which a NUL would truncate — hex never contains
-one), with a one-char status prefix distinguishing data / EOF / error.
+The pump (the SSL_get_error / WANT_READ / WANT_WRITE logic) lives in the
+C shim; this driver only moves ciphertext hex and reacts to the shim's
+status codes. Ciphertext crosses the FFI boundary as hex (NUL-free);
+plaintext in as String+len, out as hex.
 """)]
 
+import net.tcp
 import net.http
 import encoding.hex
 
 #[doc("""
-An established, verified TLS connection. `slot` indexes the shim's
-connection table; the field is private so callers cannot forge one.
+An established, verified TLS connection: a NetTcp `Conn` carrying the
+ciphertext, paired with the shim `slot` holding the SSL state. Both
+private — the pair has one owner (this module) and one ordered close.
 
-OWNERSHIP: the caller MUST `close` a connection on every path, including
-errors — there is no finalizer. The connection table is a fixed 128
-slots; a leaked handle (a `connect` whose `close` is skipped) is never
-reclaimed, so a long-running program that leaks eventually fails every
-`connect` with a table-full error. `https.request` closes on all paths;
-direct users of this module must do the same.
+OWNERSHIP: close on every path. `close` tears down both halves in order
+(shutdown → drain → NetTcp.close → free slot); skipping it leaks a slot
+(table of 128) and a NetTcp fd.
 """)]
-pub type TlsConn = { priv slot: Int }
+pub type TlsConn = { priv conn: tcp.Conn, priv slot: Int }
 
-#[doc("""
-Build a `TlsConn` from a raw slot. This is the escape hatch for a test
-that installs its own `Tls` handler and must hand back a handle without
-touching OpenSSL — production code never calls it (the flat `connect`
-mints handles). The slot need not be live; a mock handler that also
-stubs `send` / `recv` never dereferences it.
-""")]
-pub fn conn_from_slot(slot: Int) : TlsConn = TlsConn { slot: slot }
+# ---- shim entry points --------------------------------------------
 
-# ---- raw shim entry points ---------------------------------------
+# Create SSL + memory BIOs, arm SNI/verify, start the client handshake.
+# Returns a slot >= 0, or negative on error.
+extern "C"("kai_tls_new")           fn raw_new(host: String, insecure: Int) : Int / Ffi
+extern "C"("kai_tls_free")          fn raw_free(slot: Int) : Unit / Ffi
+# Ciphertext transport: take pending outgoing (hex, "" if none) / feed incoming (hex).
+extern "C"("kai_tls_take_outgoing") fn raw_take_outgoing(slot: Int) : String / Ffi
+extern "C"("kai_tls_put_incoming")  fn raw_put_incoming(slot: Int, hex: String) : Unit / Ffi
+# Pump: advance handshake, or encrypt/decrypt. Return codes below.
+extern "C"("kai_tls_step")          fn raw_step(slot: Int) : Int / Ffi
+extern "C"("kai_tls_write")         fn raw_write(slot: Int, data: String, len: Int) : Int / Ffi
+extern "C"("kai_tls_read")          fn raw_read(slot: Int, max: Int) : String / Ffi
+extern "C"("kai_tls_shutdown")      fn raw_shutdown(slot: Int) : Unit / Ffi
 
-# Handshake: DNS + TCP connect + SSL_connect + SNI + verify, all in one
-# C call. Returns a non-negative slot, or a negative KAI_TLS_ERR_* code.
-extern "C"("kai_tls_connect")
-fn raw_connect(host: String, port: Int) : Int / Ffi
+# Shim status codes (mirror the #defines in ffi/tls_openssl.c).
+const TLS_OK         : Int = 0
+const TLS_WANT_READ  : Int = 1
+const TLS_WANT_WRITE : Int = 2
+const TLS_ERR_VERIFY : Int = 0 - 3
 
-# Write the first `len` bytes of `data` (its raw pointer, NUL-safe).
-# Returns bytes written (>0), 0 on clean shutdown, -1 on error.
-extern "C"("kai_tls_send")
-fn raw_send(slot: Int, data: String, len: Int) : Int / Ffi
+# ---- ciphertext shuttle -------------------------------------------
 
-# Read up to `max` bytes; returns "d<hex>" / "e" (EOF) / "x" (error).
-extern "C"("kai_tls_recv")
-fn raw_recv(slot: Int, max: Int) : String / Ffi
-
-extern "C"("kai_tls_close")
-fn raw_close(slot: Int) : Unit / Ffi
-
-# Toggle certificate verification off (process-wide). Only `connect_insecure`
-# flips this; it is never exposed as a boolean parameter.
-extern "C"("kai_tls_set_insecure")
-fn raw_set_insecure(on: Int) : Unit / Ffi
-
-# ---- error mapping ------------------------------------------------
-
-# Map a negative shim connect code to a discriminated message. Keeping
-# verify distinct from a transport error is load-bearing: a rejected
-# certificate must never read as a retryable network hiccup.
-fn connect_error(code: Int) : String = match code {
-  -1 -> "tls: connection table full"
-  -2 -> "tls: DNS resolution failed"
-  -3 -> "tls: TCP connect refused"
-  -4 -> "tls: SSL context/handle allocation failed"
-  -5 -> "tls: TLS handshake failed"
-  -6 -> "tls: certificate verification failed"
-  _  -> "tls: unknown error (code #{int_to_string(code)})"
-}
-
-# ---- public flat API ----------------------------------------------
-
-#[doc("""
-Open a verified TLS connection to `host:port`. The handshake resolves
-DNS, connects, negotiates TLS (>= 1.2), sends SNI, and verifies the
-certificate chain and hostname — all mandatory. `Err` discriminates
-DNS / connect / handshake / verify so the caller can react.
-""")]
-pub fn connect(host: String, port: Int) : Result[String, TlsConn] / Ffi = {
-  let code = raw_connect(host, port)
-  if code < 0 { Err(connect_error(code)) }
-  else { Ok(TlsConn { slot: code }) }
-}
-
-#[doc("""
-Open a TLS connection WITHOUT certificate verification. The ugly name
-is deliberate: this defeats the guarantee TLS exists to provide and is
-only for a dev box with a self-signed cert. Never reach for it in
-production. SNI is still sent, and the channel is still encrypted —
-but an attacker in the middle is undetectable.
-
-The insecure window (verification off) spans only this call: the shim
-toggles a process-wide flag on, connects, and toggles it off. This is
-safe because the shim's socket is plain-blocking and the reactor never
-sees it, so `connect` blocks the OS thread — no concurrent `connect` can
-slip into the window. See the shim `insecure_mode` invariant.
-""")]
-pub fn connect_insecure(host: String, port: Int) : Result[String, TlsConn] / Ffi = {
-  raw_set_insecure(1)
-  let r = connect(host, port)
-  raw_set_insecure(0)
-  r
-}
-
-#[doc("""
-Send `data` (a byte list, each in `[0, 255]`) over the connection in ONE
-write. Returns the number of bytes accepted, which may be LESS than the
-input — the OS/TLS layer can accept a partial buffer. For a complete
-message use `send_all`; this low-level form exists for callers that want
-to manage their own write loop.
-""")]
-pub fn send(c: TlsConn, data: [Int]) : Result[String, Int] / Ffi = {
-  let bytes = http.bytes_to_string(data)
-  send_bytes(c, bytes, list_length(data))
-}
-
-# Send from an already-encoded byte String with an explicit length. The
-# String's raw pointer is NUL-safe for `len` bytes, so this is the true
-# boundary; `send` / `send_all` funnel through it.
-fn send_bytes(c: TlsConn, bytes: String, len: Int) : Result[String, Int] / Ffi = {
-  let n = raw_send(c.slot, bytes, len)
-  if n < 0 { Err("tls: send failed (connection closed?)") }
-  else { Ok(n) }
-}
-
-#[doc("""
-Send ALL of `data`, looping until every byte is written or the
-connection breaks. This is what a protocol wants: a short write from
-`send` leaves the peer waiting for the rest of the message. `Ok(())` iff
-the whole buffer went out.
-""")]
-pub fn send_all(c: TlsConn, data: [Int]) : Result[String, Unit] / Ffi = {
-  let bytes = http.bytes_to_string(data)
-  send_all_loop(c, bytes, list_length(data), 0)
-}
-
-# Write the tail of `bytes` starting at `off` until `off` reaches `len`.
-# A write of 0 means the peer closed mid-message (clean shutdown with the
-# message unfinished) — an error here, and the guard that stops this from
-# spinning forever on a stuck-at-zero write.
-#
-# `string_slice` copies, so this is O(n²) if a write of size B needs n/B
-# partial writes. In practice a blocking socket's SSL_write drains the
-# whole buffer in one call, so the loop runs once and no slice is taken;
-# the tail slice only materialises on a genuine short write, which chunks
-# at ~record size. Fine for HTTP bodies; a multi-MB streaming sender would
-# want the offset pushed into the shim instead.
-fn send_all_loop(c: TlsConn, bytes: String, len: Int, off: Int) : Result[String, Unit] / Ffi = {
-  if off >= len { Ok(()) }
-  else if off == 0 {
-    # Fast path: first write attempts the whole buffer with no slice copy.
-    match send_bytes(c, bytes, len) {
-      Err(e) -> Err(e)
-      Ok(0)  -> Err("tls: connection closed mid-write")
-      Ok(n)  -> if n >= len { Ok(()) } else { send_all_loop(c, bytes, len, n) }
+# Drain all pending outgoing ciphertext from the shim's write-BIO and
+# send it over NetTcp. Called after EVERY pump op — OpenSSL can emit
+# bytes even when it returns WANT_READ, and leaving them buffered hangs
+# the peer. Loops until the shim reports nothing pending.
+fn drain_outgoing(c: tcp.Conn, slot: Int) : Result[String, Unit] / NetTcp + Ffi = {
+  let out = raw_take_outgoing(slot)
+  if string_length(out) == 0 { Ok(()) }
+  else { match hex.decode(out) {
+    None     -> Err("tls: bad outgoing ciphertext frame")
+    Some(bs) -> match NetTcp.send(c, bs) {
+      Err(e) -> Err(string_concat("tls: transport send: ", e))
+      Ok(_)  -> drain_outgoing(c, slot)   # more may be pending
     }
-  } else {
-    let tail = string_slice(bytes, off, len - off)
-    match send_bytes(c, tail, len - off) {
-      Err(e) -> Err(e)
-      Ok(0)  -> Err("tls: connection closed mid-write")
-      Ok(n)  -> send_all_loop(c, bytes, len, off + n)
+  } }
+}
+
+# Pull one chunk of ciphertext from NetTcp and feed it into the shim's
+# read-BIO. Ok(true) on bytes fed, Ok(false) at peer EOF.
+fn feed_incoming(c: tcp.Conn, slot: Int) : Result[String, Bool] / NetTcp + Ffi =
+  match NetTcp.recv(c, 16384) {
+    Err(e) -> Err(string_concat("tls: transport recv: ", e))
+    Ok(bs) -> match bs {
+      [] -> Ok(false)                     # peer closed
+      _  -> { raw_put_incoming(slot, hex.encode(bs)); Ok(true) }
     }
+  }
+
+# ---- handshake ----------------------------------------------------
+
+# Drive the handshake to completion: step, drain outgoing, and on
+# WANT_READ feed incoming, until the shim reports OK.
+fn handshake(c: tcp.Conn, slot: Int) : Result[String, Unit] / NetTcp + Ffi = {
+  let st = raw_step(slot)
+  match drain_outgoing(c, slot) {
+    Err(e) -> Err(e)
+    Ok(_) ->
+      if st == TLS_OK { Ok(()) }
+      else if st == TLS_ERR_VERIFY { Err("tls: certificate verification failed") }
+      else if st < 0 { Err("tls: handshake failed") }
+      else if st == TLS_WANT_READ {
+        match feed_incoming(c, slot) {
+          Err(e)        -> Err(e)
+          Ok(false)     -> Err("tls: peer closed during handshake")
+          Ok(true)      -> handshake(c, slot)
+        }
+      }
+      else { handshake(c, slot) }        # WANT_WRITE: drained, loop
+  }
+}
+
+# ---- public API ----------------------------------------------------
+
+fn connect_impl(host: String, port: Int, insecure: Int)
+    : Result[String, TlsConn] / NetTcp + Ffi =
+  match NetTcp.connect(host, port) {
+    Err(e) -> Err(string_concat("tls: connect: ", e))
+    Ok(c)  -> {
+      let slot = raw_new(host, insecure)
+      if slot < 0 { NetTcp.close(c); Err("tls: SSL init failed") }
+      else { match handshake(c, slot) {
+        Err(e) -> { raw_free(slot); NetTcp.close(c); Err(e) }
+        Ok(_)  -> Ok(TlsConn { conn: c, slot: slot })
+      } }
+    }
+  }
+
+#[doc("""
+Open a verified TLS connection to `host:port` over NetTcp. Resolves,
+connects, and runs the TLS handshake with SNI and mandatory chain +
+hostname verification. `Err` names the failing layer.
+""")]
+pub fn connect(host: String, port: Int) : Result[String, TlsConn] / NetTcp + Ffi =
+  connect_impl(host, port, 0)
+
+#[doc("""
+Open a TLS connection WITHOUT certificate verification. The ugly name is
+deliberate — this defeats what TLS is for; only for a dev box with a
+self-signed cert, never production. SNI is sent and the channel is still
+encrypted, but a man in the middle is undetectable. Verification is a
+per-connection flag now, so this is safe alongside concurrent verified
+connects.
+""")]
+pub fn connect_insecure(host: String, port: Int) : Result[String, TlsConn] / NetTcp + Ffi =
+  connect_impl(host, port, 1)
+
+#[doc("""
+Send `data` (bytes, each in `[0, 255]`) over the connection. Encrypts via
+the shim and drains the ciphertext to NetTcp. Sends everything or `Err`.
+""")]
+pub fn send(c: TlsConn, data: [Int]) : Result[String, Unit] / NetTcp + Ffi = {
+  let bytes = http.bytes_to_string(data)
+  let st = raw_write(c.slot, bytes, list_length(data))
+  # Drain unconditionally (same invariant as handshake): a failed write may
+  # still have queued a TLS alert the peer needs to see. Decide Err after.
+  match drain_outgoing(c.conn, c.slot) {
+    Err(e) -> Err(e)
+    Ok(_)  -> if st < 0 { Err("tls: encrypt failed") } else { Ok(()) }
   }
 }
 
 #[doc("""
-Receive up to `max` bytes. Returns `Ok([])` at a clean end of stream
-(the peer closed the TLS session), a non-empty list otherwise, or `Err`
-on a transport error. Decodes the shim's hex frame back to bytes.
-
-`max` is capped at 65536 by the shim: a larger `max` reads at most that
-many bytes per call, so drain in a loop (as `https` does) rather than
-assuming one `recv` returns the whole stream.
+Receive up to `max` decrypted bytes. `Ok([])` at clean end of stream.
+On the shim's WANT_READ, pulls more ciphertext from NetTcp and retries.
 """)]
-pub fn recv(c: TlsConn, max: Int) : Result[String, [Int]] / Ffi = {
-  let frame = raw_recv(c.slot, max)
+pub fn recv(c: TlsConn, max: Int) : Result[String, [Int]] / NetTcp + Ffi = {
+  let frame = raw_read(c.slot, max)
   match char_at(frame, 0) {
-    None      -> Ok([])                              # empty ≡ EOF, defensive
-    Some('e') -> Ok([])                              # clean EOF
-    Some('x') -> Err("tls: recv failed")
+    None      -> Ok([])
+    Some('e') -> Ok([])                       # clean EOF
+    Some('x') -> Err("tls: decrypt failed")
+    Some('r') ->                              # WANT_READ: feed ciphertext, retry
+      match feed_incoming(c.conn, c.slot) {
+        Err(e)    -> Err(e)
+        Ok(false) -> Ok([])                   # peer closed with no more data
+        Ok(true)  -> recv(c, max)
+      }
     Some('d') -> {
       let body = string_slice(frame, 1, string_length(frame) - 1)
       match hex.decode(body) {
         Some(bs) -> Ok(bs)
-        None     -> Err("tls: malformed recv frame")
+        None     -> Err("tls: malformed decrypt frame")
       }
     }
-    Some(_)   -> Err("tls: malformed recv frame")
+    Some(_)   -> Err("tls: malformed decrypt frame")
   }
 }
 
-#[doc("Close the TLS session and release its slot. Idempotent on a stale handle.")]
-pub fn close(c: TlsConn) : Unit / Ffi = raw_close(c.slot)
+#[doc("""
+Close the connection: TLS shutdown (emits close_notify), drain it to the
+peer, close the NetTcp transport, free the SSL slot — in that order, so
+the peer sees a clean close. Idempotent-ish: safe to call once per conn.
+""")]
+pub fn close(c: TlsConn) : Unit / NetTcp + Ffi = {
+  raw_shutdown(c.slot)
+  let _ = drain_outgoing(c.conn, c.slot)     # best-effort close_notify
+  NetTcp.close(c.conn)
+  raw_free(c.slot)
+}

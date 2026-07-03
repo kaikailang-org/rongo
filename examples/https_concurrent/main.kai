@@ -1,0 +1,34 @@
+#[doc("""
+Two HTTPS requests running concurrently in one nursery — the payoff of
+0.2.0's TLS-over-NetTcp rearchitecture.
+
+In 0.1.0 the shim owned a blocking socket, so a TLS request in flight
+froze the whole OS thread: two requests could not overlap. Now TLS runs
+over NetTcp's reactor-aware transport, so while one request is parked
+waiting on the network the other fiber runs. Both complete; neither
+blocks the other.
+
+Build & run (from the repo root):
+  make example-concurrent && ./build/https_concurrent
+""")]
+
+import rongo.https
+import net.http
+import spawn
+
+# Fetch a URL and return a one-line summary. Runs on its own fiber.
+fn fetch(url: String) : String / NetTcp + Ffi = {
+  let resp = https.get(url)
+  if resp.status == 0 { "#{url} -> failed: #{resp.body}" }
+  else { "#{url} -> #{int_to_string(resp.status)}, #{int_to_string(string_length(resp.body))} bytes" }
+}
+
+fn main() : Unit / Console + NetTcp + Ffi + Spawn = {
+  let urls = ["https://example.com/", "https://postman-echo.com/get"]
+  let results = nursery { n ->
+    let fibers = urls | (u => n.spawn(() => fetch(u)))
+    fibers | (f => n.await(f))
+  }
+  results | (line => print(line))
+  print("both done — neither blocked the other")
+}
