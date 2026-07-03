@@ -1,0 +1,34 @@
+#[doc("""
+Fetch an https:// URL and print the status, a few headers, and the body
+length. The whole point of rongo's TLS lane in one program: this is the
+`https://` that `net.http` rejects.
+
+Build & run (from the repo root):
+  make example && ./build/https_get
+Or directly:
+  CFLAGS="-std=c99 ffi/tls_openssl.c $(pkg-config --cflags --libs openssl)" \
+    kai run ./examples/https_get
+""")]
+
+import rongo.https
+import net.http
+
+fn show_header(name: String, resp: http.Response) : Unit / Console =
+  match http.header_lookup(resp.headers, name) {
+    Some(v) -> print("  #{name}: #{v}")
+    None    -> ()
+  }
+
+fn main() : Unit / Console + Ffi = {
+  let url = "https://example.com/"
+  print("GET #{url}")
+  let resp = https.get(url)
+  if resp.status == 0 {
+    print("failed: #{resp.body}")
+  } else {
+    print("status: #{int_to_string(resp.status)}")
+    show_header("Content-Type", resp)
+    show_header("Content-Length", resp)
+    print("body: #{int_to_string(string_length(resp.body))} bytes")
+  }
+}

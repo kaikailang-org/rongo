@@ -1,0 +1,48 @@
+# URL parsing for the https lane. Pure — no network, no FFI.
+
+import rongo.https
+
+test "parse_url fills default port 443" {
+  match https.parse_url("https://example.com/") {
+    Ok(u)  -> {
+      assert u.host == "example.com"
+      assert u.port == 443
+      assert u.path == "/"
+    }
+    Err(_) -> { assert false }
+  }
+}
+
+test "parse_url keeps explicit port and path" {
+  match https.parse_url("https://api.host.dev:8443/v1/things") {
+    Ok(u)  -> {
+      assert u.host == "api.host.dev"
+      assert u.port == 8443
+      assert u.path == "/v1/things"
+    }
+    Err(_) -> { assert false }
+  }
+}
+
+test "parse_url normalises a missing path to /" {
+  match https.parse_url("https://example.com") {
+    Ok(u)  -> { assert u.path == "/" }
+    Err(_) -> { assert false }
+  }
+}
+
+test "parse_url rejects http scheme" {
+  match https.parse_url("http://example.com/") {
+    Ok(_)  -> { assert false }
+    Err(_) -> { assert true }
+  }
+}
+
+test "parse_url rejects a missing scheme separator" {
+  match https.parse_url("example.com/path") {
+    Ok(_)  -> { assert false }
+    Err(_) -> { assert true }
+  }
+}
+
+fn main() : Int = 0

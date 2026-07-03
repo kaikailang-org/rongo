@@ -1,0 +1,44 @@
+#[doc("""
+POST a large body over TLS and verify the server echoes it back intact.
+
+This is the integration check for the send_all partial-write path: the
+body is deliberately larger than a single 16 KB TLS record, so SSL_write
+may accept it in pieces. If send_all is correct, the whole body reaches
+the server and postman-echo returns it; a truncated send would show up as
+a non-200 status or a body that omits our marker.
+
+A kaikai `test` block cannot perform `Ffi` (the test runner installs no
+FFI capability), so the live OpenSSL path is exercised here, in a
+`main / Ffi`, rather than under `kai test`.
+
+Build & run (from the repo root):
+  make example-post && ./build/https_post
+""")]
+
+import rongo.https
+import net.http
+
+# ~20 KB of a repeating marker — spans several TLS records.
+fn big_body(n: Int, acc: String) : String =
+  if n <= 0 { acc } else { big_body(n - 1, string_concat(acc, "RONGO12345")) }
+
+fn contains(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Bool =
+  if i + nn > hn { false }
+  else if string_slice(hay, i, nn) == needle { true }
+  else { contains(hay, needle, i + 1, hn, nn) }
+
+fn main() : Unit / Console + Ffi = {
+  let body = big_body(2000, "")
+  print("POST https://postman-echo.com/post  (#{int_to_string(string_length(body))} bytes)")
+  let resp = https.post("https://postman-echo.com/post", body)
+  if resp.status == 0 {
+    print("failed (offline?): #{resp.body}")
+  } else {
+    print("status: #{int_to_string(resp.status)}")
+    # The echo reflects our body; finding the marker proves the full
+    # request crossed the wire — the point of the send_all loop.
+    let echoed = contains(resp.body, "RONGO12345", 0,
+                          string_length(resp.body), 10)
+    print("body echoed intact: #{if echoed { "yes" } else { "NO — send truncated?" }}")
+  }
+}

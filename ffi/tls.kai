@@ -1,0 +1,206 @@
+#[doc("""
+Base TLS layer — the flat FFI engine over OpenSSL. `import rongo.ffi.tls`.
+
+This is the always-available motor: plain `extern "C"` calls into the
+`ffi/tls_openssl.c` slot-table shim, wrapped in `Result[String, _]` so
+the surface reads like `NetTcp`. The optional `effect Tls` (in the
+parent `tls` module) delegates here; tests mock the effect, production
+runs this.
+
+Bytes are `[Int]` (each element in `[0, 255]`), matching `NetTcp` and
+`net.http`. They cross the FFI boundary as a `String`: kaikai's FFI
+delivers a `String` param as a raw byte pointer valid for its full
+length across embedded NUL, so `send` carries binary losslessly with an
+explicit length. `recv` comes back hex-encoded (a returned `String` is
+repacked strlen-based, which a NUL would truncate — hex never contains
+one), with a one-char status prefix distinguishing data / EOF / error.
+""")]
+
+import net.http
+import encoding.hex
+
+#[doc("""
+An established, verified TLS connection. `slot` indexes the shim's
+connection table; the field is private so callers cannot forge one.
+
+OWNERSHIP: the caller MUST `close` a connection on every path, including
+errors — there is no finalizer. The connection table is a fixed 128
+slots; a leaked handle (a `connect` whose `close` is skipped) is never
+reclaimed, so a long-running program that leaks eventually fails every
+`connect` with a table-full error. `https.request` closes on all paths;
+direct users of this module must do the same.
+""")]
+pub type TlsConn = { priv slot: Int }
+
+#[doc("""
+Build a `TlsConn` from a raw slot. This is the escape hatch for a test
+that installs its own `Tls` handler and must hand back a handle without
+touching OpenSSL — production code never calls it (the flat `connect`
+mints handles). The slot need not be live; a mock handler that also
+stubs `send` / `recv` never dereferences it.
+""")]
+pub fn conn_from_slot(slot: Int) : TlsConn = TlsConn { slot: slot }
+
+# ---- raw shim entry points ---------------------------------------
+
+# Handshake: DNS + TCP connect + SSL_connect + SNI + verify, all in one
+# C call. Returns a non-negative slot, or a negative KAI_TLS_ERR_* code.
+extern "C"("kai_tls_connect")
+fn raw_connect(host: String, port: Int) : Int / Ffi
+
+# Write the first `len` bytes of `data` (its raw pointer, NUL-safe).
+# Returns bytes written (>0), 0 on clean shutdown, -1 on error.
+extern "C"("kai_tls_send")
+fn raw_send(slot: Int, data: String, len: Int) : Int / Ffi
+
+# Read up to `max` bytes; returns "d<hex>" / "e" (EOF) / "x" (error).
+extern "C"("kai_tls_recv")
+fn raw_recv(slot: Int, max: Int) : String / Ffi
+
+extern "C"("kai_tls_close")
+fn raw_close(slot: Int) : Unit / Ffi
+
+# Toggle certificate verification off (process-wide). Only `connect_insecure`
+# flips this; it is never exposed as a boolean parameter.
+extern "C"("kai_tls_set_insecure")
+fn raw_set_insecure(on: Int) : Unit / Ffi
+
+# ---- error mapping ------------------------------------------------
+
+# Map a negative shim connect code to a discriminated message. Keeping
+# verify distinct from a transport error is load-bearing: a rejected
+# certificate must never read as a retryable network hiccup.
+fn connect_error(code: Int) : String = match code {
+  -1 -> "tls: connection table full"
+  -2 -> "tls: DNS resolution failed"
+  -3 -> "tls: TCP connect refused"
+  -4 -> "tls: SSL context/handle allocation failed"
+  -5 -> "tls: TLS handshake failed"
+  -6 -> "tls: certificate verification failed"
+  _  -> "tls: unknown error (code #{int_to_string(code)})"
+}
+
+# ---- public flat API ----------------------------------------------
+
+#[doc("""
+Open a verified TLS connection to `host:port`. The handshake resolves
+DNS, connects, negotiates TLS (>= 1.2), sends SNI, and verifies the
+certificate chain and hostname — all mandatory. `Err` discriminates
+DNS / connect / handshake / verify so the caller can react.
+""")]
+pub fn connect(host: String, port: Int) : Result[String, TlsConn] / Ffi = {
+  let code = raw_connect(host, port)
+  if code < 0 { Err(connect_error(code)) }
+  else { Ok(TlsConn { slot: code }) }
+}
+
+#[doc("""
+Open a TLS connection WITHOUT certificate verification. The ugly name
+is deliberate: this defeats the guarantee TLS exists to provide and is
+only for a dev box with a self-signed cert. Never reach for it in
+production. SNI is still sent, and the channel is still encrypted —
+but an attacker in the middle is undetectable.
+
+The insecure window (verification off) spans only this call: the shim
+toggles a process-wide flag on, connects, and toggles it off. This is
+safe because the shim's socket is plain-blocking and the reactor never
+sees it, so `connect` blocks the OS thread — no concurrent `connect` can
+slip into the window. See the shim `insecure_mode` invariant.
+""")]
+pub fn connect_insecure(host: String, port: Int) : Result[String, TlsConn] / Ffi = {
+  raw_set_insecure(1)
+  let r = connect(host, port)
+  raw_set_insecure(0)
+  r
+}
+
+#[doc("""
+Send `data` (a byte list, each in `[0, 255]`) over the connection in ONE
+write. Returns the number of bytes accepted, which may be LESS than the
+input — the OS/TLS layer can accept a partial buffer. For a complete
+message use `send_all`; this low-level form exists for callers that want
+to manage their own write loop.
+""")]
+pub fn send(c: TlsConn, data: [Int]) : Result[String, Int] / Ffi = {
+  let bytes = http.bytes_to_string(data)
+  send_bytes(c, bytes, list_length(data))
+}
+
+# Send from an already-encoded byte String with an explicit length. The
+# String's raw pointer is NUL-safe for `len` bytes, so this is the true
+# boundary; `send` / `send_all` funnel through it.
+fn send_bytes(c: TlsConn, bytes: String, len: Int) : Result[String, Int] / Ffi = {
+  let n = raw_send(c.slot, bytes, len)
+  if n < 0 { Err("tls: send failed (connection closed?)") }
+  else { Ok(n) }
+}
+
+#[doc("""
+Send ALL of `data`, looping until every byte is written or the
+connection breaks. This is what a protocol wants: a short write from
+`send` leaves the peer waiting for the rest of the message. `Ok(())` iff
+the whole buffer went out.
+""")]
+pub fn send_all(c: TlsConn, data: [Int]) : Result[String, Unit] / Ffi = {
+  let bytes = http.bytes_to_string(data)
+  send_all_loop(c, bytes, list_length(data), 0)
+}
+
+# Write the tail of `bytes` starting at `off` until `off` reaches `len`.
+# A write of 0 means the peer closed mid-message (clean shutdown with the
+# message unfinished) — an error here, and the guard that stops this from
+# spinning forever on a stuck-at-zero write.
+#
+# `string_slice` copies, so this is O(n²) if a write of size B needs n/B
+# partial writes. In practice a blocking socket's SSL_write drains the
+# whole buffer in one call, so the loop runs once and no slice is taken;
+# the tail slice only materialises on a genuine short write, which chunks
+# at ~record size. Fine for HTTP bodies; a multi-MB streaming sender would
+# want the offset pushed into the shim instead.
+fn send_all_loop(c: TlsConn, bytes: String, len: Int, off: Int) : Result[String, Unit] / Ffi = {
+  if off >= len { Ok(()) }
+  else if off == 0 {
+    # Fast path: first write attempts the whole buffer with no slice copy.
+    match send_bytes(c, bytes, len) {
+      Err(e) -> Err(e)
+      Ok(0)  -> Err("tls: connection closed mid-write")
+      Ok(n)  -> if n >= len { Ok(()) } else { send_all_loop(c, bytes, len, n) }
+    }
+  } else {
+    let tail = string_slice(bytes, off, len - off)
+    match send_bytes(c, tail, len - off) {
+      Err(e) -> Err(e)
+      Ok(0)  -> Err("tls: connection closed mid-write")
+      Ok(n)  -> send_all_loop(c, bytes, len, off + n)
+    }
+  }
+}
+
+#[doc("""
+Receive up to `max` bytes. Returns `Ok([])` at a clean end of stream
+(the peer closed the TLS session), a non-empty list otherwise, or `Err`
+on a transport error. Decodes the shim's hex frame back to bytes.
+
+`max` is capped at 65536 by the shim: a larger `max` reads at most that
+many bytes per call, so drain in a loop (as `https` does) rather than
+assuming one `recv` returns the whole stream.
+""")]
+pub fn recv(c: TlsConn, max: Int) : Result[String, [Int]] / Ffi = {
+  let frame = raw_recv(c.slot, max)
+  match char_at(frame, 0) {
+    None      -> Ok([])                              # empty ≡ EOF, defensive
+    Some('e') -> Ok([])                              # clean EOF
+    Some('x') -> Err("tls: recv failed")
+    Some('d') -> {
+      let body = string_slice(frame, 1, string_length(frame) - 1)
+      match hex.decode(body) {
+        Some(bs) -> Ok(bs)
+        None     -> Err("tls: malformed recv frame")
+      }
+    }
+    Some(_)   -> Err("tls: malformed recv frame")
+  }
+}
+
+#[doc("Close the TLS session and release its slot. Idempotent on a stale handle.")]
+pub fn close(c: TlsConn) : Unit / Ffi = raw_close(c.slot)

@@ -1,0 +1,169 @@
+#[doc("""
+HTTPS — HTTP/1.1 over the `Tls` lane. `import rongo.https`, reached
+qualified (`https.get(url)`).
+
+This is the payoff of rongo's TLS lane: the `https://` that
+`net.http` rejects at parse time. It reuses net.http's transport-agnostic
+machinery — the response parser, header lookup, chunked decoding — and
+supplies only the two pieces net.http couples to plaintext `NetTcp`: a
+URL parser that accepts `https://`, and a request driver that runs the
+bytes over `tls` instead of `NetTcp`.
+
+Scope mirrors net.http v1: HTTP/1.1, one request per connection (connect,
+send, drain to close, close), `Content-Length` or chunked response
+bodies. No keep-alive, no compression, no cookies.
+""")]
+
+import net.http
+import rongo.ffi.tls
+
+# ---- HTTPS URL parsing --------------------------------------------
+#
+# net.http.parse_url rejects `https://` by design, so rongo carries its
+# own parser. Shape: `https://<host>[:<port>][/<path>]`, default port
+# 443, path normalised to begin with `/`.
+
+fn find(hay: String, needle: String) : Int = find_loop(hay, needle, 0,
+  string_length(hay), string_length(needle))
+
+fn find_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int =
+  if nn == 0 { 0 }
+  else if i + nn > hn { 0 - 1 }
+  else if string_slice(hay, i, nn) == needle { i }
+  else { find_loop(hay, needle, i + 1, hn, nn) }
+
+fn split_authority(auth: String) : http.HttpHostPort = {
+  let i = find(auth, ":")
+  if i < 0 { http.HttpHostPort { host: auth, port: 0 } }
+  else {
+    let h = string_slice(auth, 0, i)
+    let rest = string_slice(auth, i + 1, string_length(auth) - i - 1)
+    match string_to_int(rest) {
+      Some(p) -> http.HttpHostPort { host: h, port: p }
+      None    -> http.HttpHostPort { host: h, port: 0 }
+    }
+  }
+}
+
+#[doc("""
+Parse an `https://` URL. Rejects any other scheme — `http://` belongs to
+`net.http`, and rongo is specifically the TLS lane. Default port is 443.
+""")]
+pub fn parse_url(s: String) : Result[String, http.HttpUrl] = {
+  let sep = "://"
+  let i   = find(s, sep)
+  if i < 0 { Err("https.parse_url: missing scheme separator '://'") }
+  else {
+    let scheme = string_slice(s, 0, i)
+    let rest   = string_slice(s, i + 3, string_length(s) - i - 3)
+    if scheme != "https" {
+      Err("https.parse_url: only https:// is supported (got '#{scheme}://')")
+    } else {
+      let path_at = find(rest, "/")
+      let auth = if path_at < 0 { rest } else { string_slice(rest, 0, path_at) }
+      let path = if path_at < 0 { "/" }
+                 else { string_slice(rest, path_at, string_length(rest) - path_at) }
+      let hp   = split_authority(auth)
+      let port = if hp.port == 0 { 443 } else { hp.port }
+      if string_length(hp.host) == 0 { Err("https.parse_url: empty host") }
+      else { Ok(http.HttpUrl { scheme: "https", host: hp.host, port: port, path: path }) }
+    }
+  }
+}
+
+# ---- request serialiser -------------------------------------------
+#
+# Same HTTP/1.1 framing as net.http.serialize_request, but built from
+# our own parsed URL — net.http's serialiser routes through its
+# parse_url, which would reject the https URL before framing.
+
+fn format_header(h: http.HttpHeader) : String =
+  string_concat_all([h.name, ": ", h.value, "\r\n"])
+
+fn format_headers(hs: [http.HttpHeader]) : String =
+  string_concat_all(list.map(hs, format_header))
+
+fn host_header(u: http.HttpUrl) : String =
+  if u.port == 443 { u.host }
+  else { string_concat_all([u.host, ":", int_to_string(u.port)]) }
+
+fn serialize(u: http.HttpUrl, req: http.Request) : String = {
+  let path  = if string_length(u.path) == 0 { "/" } else { u.path }
+  let line1 = string_concat_all([req.method, " ", path, " HTTP/1.1\r\n"])
+  let host  = string_concat_all(["Host: ", host_header(u), "\r\n"])
+  let clen  = string_concat_all(["Content-Length: ", int_to_string(string_length(req.body)), "\r\n"])
+  # Connection: close so the peer ends the stream and our drain loop
+  # terminates — this v1 opens a fresh connection per request.
+  let conn  = "Connection: close\r\n"
+  let extra = format_headers(req.headers)
+  string_concat_all([line1, host, clen, conn, extra, "\r\n", req.body])
+}
+
+# ---- transport over Tls -------------------------------------------
+
+# Drain the connection in 4096-byte reads until the peer closes
+# (recv returns Ok([])). Reverse-prepend each chunk, reverse once at end.
+fn recv_all(c: tls.TlsConn, acc: [Int]) : Result[String, [Int]] / Ffi =
+  match tls.recv(c, 4096) {
+    Err(e)    -> Err(e)
+    Ok(chunk) -> match chunk {
+      [] -> Ok(list_reverse(acc))
+      _  -> recv_all(c, prepend(chunk, acc))
+    }
+  }
+
+fn prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
+  []           -> acc
+  [b, ...rest] -> prepend(rest, [b, ...acc])
+}
+
+#[doc("""
+Issue `req` over TLS and return the parsed `Response`. `req.url` must be
+an absolute `https://` URL. Any failure — URL, connect, verify, send,
+recv, parse — collapses to a synthetic `Response` with status 0 and the
+error in `body`, matching net.http.request's contract so callers see the
+failure without a Result on every call.
+""")]
+pub fn request(req: http.Request) : http.Response / Ffi = {
+  match parse_url(req.url) {
+    Err(e) -> http.Response { status: 0, headers: [], body: e }
+    Ok(u)  -> match tls.connect(u.host, u.port) {
+      Err(e) -> http.Response { status: 0, headers: [], body: string_concat("connect: ", e) }
+      Ok(c)  -> {
+        let wire = serialize(u, req)
+        # send_all, not send: a short write would leave the server waiting
+        # for the rest of the request (its Content-Length is unmet).
+        match tls.send_all(c, http.string_to_bytes(wire)) {
+          Err(e) -> { tls.close(c); http.Response { status: 0, headers: [], body: string_concat("send: ", e) } }
+          Ok(_)  -> match recv_all(c, []) {
+            Err(e) -> { tls.close(c); http.Response { status: 0, headers: [], body: string_concat("recv: ", e) } }
+            Ok(bs) -> {
+              tls.close(c)
+              let raw = http.bytes_to_string(bs)
+              match http.parse_response(raw) {
+                Ok(r)  -> r
+                Err(e) -> http.Response { status: 0, headers: [], body: e }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+#[doc("Issues an HTTPS GET to `url` with no extra headers and returns the response.")]
+pub fn get(url: String) : http.Response / Ffi =
+  request(http.Request { method: "GET", url: url, headers: [], body: "" })
+
+#[doc("Issues an HTTPS POST to `url` carrying `body`, with no extra headers.")]
+pub fn post(url: String, body: String) : http.Response / Ffi =
+  request(http.Request { method: "POST", url: url, headers: [], body: body })
+
+#[doc("Issues an HTTPS PUT to `url` carrying `body`, with no extra headers.")]
+pub fn put(url: String, body: String) : http.Response / Ffi =
+  request(http.Request { method: "PUT", url: url, headers: [], body: body })
+
+#[doc("Issues an HTTPS DELETE to `url` with no extra headers.")]
+pub fn delete(url: String) : http.Response / Ffi =
+  request(http.Request { method: "DELETE", url: url, headers: [], body: "" })

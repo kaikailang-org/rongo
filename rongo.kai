@@ -1,0 +1,28 @@
+#[doc("""
+rongo — advanced networking for kaikai. The TLS lane: `https://` over
+OpenSSL, the networking that carries a system-library dependency the
+bundled kaikai install must not drag into every binary.
+
+Public surface:
+  - `rongo.ffi.tls`  — the flat TLS engine (`connect` / `send` / `recv` /
+    `close`) over OpenSSL, plus `TlsConn`.
+  - `rongo.tls`      — the `Tls` effect + `tls_wrap`, for handler-based
+    mocking in tests.
+  - `rongo.https`    — HTTP/1.1 over TLS (`get` / `post` / `request`),
+    the `https://` net.http rejects.
+
+This entry point is a thin demo. See `examples/` for real usage.
+""")]
+
+import rongo.https
+import net.http
+
+fn main() : Unit / Console + Ffi = {
+  let resp = https.get("https://example.com/")
+  if resp.status == 0 {
+    print("request failed: #{resp.body}")
+  } else {
+    print("status: #{int_to_string(resp.status)}")
+    print("body bytes: #{int_to_string(string_length(resp.body))}")
+  }
+}

@@ -1,0 +1,50 @@
+# The Tls effect, exercised against a mock handler — no network, no
+# OpenSSL. This is the payoff of layering an effect over the flat engine:
+# a test drives TLS-shaped code deterministically by substituting the
+# handler, exactly as the module doc promises.
+
+import rongo.tls.{Tls}
+import rongo.ffi.tls
+
+# A recording mock: connect hands back a stub handle, send reports the
+# byte count, recv returns a canned "hi", close is a no-op. `conn_from_slot`
+# is the escape hatch that lets the mock mint a handle without OpenSSL.
+fn with_mock[a](body: () -> a / Tls) : a =
+  handle { body() } with Tls {
+    connect(host, port, resume) -> resume(Ok(tls.conn_from_slot(0)))
+    send(c, data, resume)       -> resume(Ok(list_length(data)))
+    recv(c, max, resume)        -> resume(Ok([104, 105]))   # "hi"
+    close(c, resume)            -> resume(())
+  }
+
+# A client that performs the full connect/send/recv/close dance over the
+# Tls effect. Under the mock it never touches the network.
+fn roundtrip() : Int / Tls = match Tls.connect("example.com", 443) {
+  Err(_) -> 0 - 1
+  Ok(c)  -> {
+    let sent = match Tls.send(c, [71, 69, 84]) { Ok(n) -> n  Err(_) -> 0 }
+    let got  = match Tls.recv(c, 4096) { Ok(bs) -> list_length(bs)  Err(_) -> 0 }
+    Tls.close(c)
+    sent * 100 + got
+  }
+}
+
+test "Tls effect drives through a mock handler" {
+  # 3 bytes sent, 2 received -> 3*100 + 2.
+  assert with_mock(roundtrip) == 302
+}
+
+test "a failing connect handler propagates Err" {
+  let r = handle { Tls.connect("nope", 1) } with Tls {
+    connect(host, port, resume) -> resume(Err("mock: refused"))
+    send(c, data, resume)       -> resume(Ok(0))
+    recv(c, max, resume)        -> resume(Ok([]))
+    close(c, resume)            -> resume(())
+  }
+  match r {
+    Ok(_)  -> { assert false }
+    Err(e) -> { assert e == "mock: refused" }
+  }
+}
+
+fn main() : Int = 0

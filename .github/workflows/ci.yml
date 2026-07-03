@@ -1,0 +1,42 @@
+name: ci
+
+# The unit tests (kai test) cover pure parsing and the Tls effect mock,
+# but kaikai's test runner installs no Ffi capability, so the real
+# OpenSSL path — handshake, cert verification, EINTR retry, send_all's
+# partial-write loop — is only exercised by the runnable examples. This
+# workflow runs them so those paths cannot regress silently.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL 4 and kaikai
+        run: |
+          brew update
+          brew install openssl@4
+          brew tap kaikailang-org/kaikai
+          brew install kaikai
+          kai --version
+
+      - name: Unit tests (pure parsers + effect mock)
+        run: make test
+
+      - name: Live GET over TLS
+        run: |
+          make example
+          ./build/https_get | tee /tmp/get.out
+          grep -q "status: 200" /tmp/get.out
+
+      - name: Live POST — send_all partial-write path (>16 KB body)
+        run: |
+          make example-post
+          ./build/https_post | tee /tmp/post.out
+          grep -q "status: 200" /tmp/post.out
+          grep -q "body echoed intact: yes" /tmp/post.out
