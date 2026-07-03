@@ -34,6 +34,8 @@ pub type TlsConn = { priv conn: tcp.Conn, priv slot: Int }
 # Create SSL + memory BIOs, arm SNI/verify, start the client handshake.
 # Returns a slot >= 0, or negative on error.
 extern "C"("kai_tls_new")           fn raw_new(host: String, insecure: Int) : Int / Ffi
+extern "C"("kai_tls_new_with_cert") fn raw_new_with_cert(host: String, cert: String, key: String) : Int / Ffi
+extern "C"("kai_tls_new_with_cert_ca") fn raw_new_with_cert_ca(host: String, cert: String, key: String, ca: String) : Int / Ffi
 extern "C"("kai_tls_free")          fn raw_free(slot: Int) : Unit / Ffi
 # Ciphertext transport: take pending outgoing (hex, "" if none) / feed incoming (hex).
 extern "C"("kai_tls_take_outgoing") fn raw_take_outgoing(slot: Int) : String / Ffi
@@ -110,19 +112,25 @@ fn handshake(c: tcp.Conn, slot: Int) : Result[String, Unit] / NetTcp + Ffi = {
 
 # ---- public API ----------------------------------------------------
 
-fn connect_impl(host: String, port: Int, insecure: Int)
+# Open the TCP transport, run the TLS handshake over `slot` (already
+# created by one of the raw_new variants), and pair them into a TlsConn.
+# A slot < 0 means the SSL setup failed (bad client cert, etc).
+fn connect_over(host: String, port: Int, slot: Int)
     : Result[String, TlsConn] / NetTcp + Ffi =
-  match NetTcp.connect(host, port) {
-    Err(e) -> Err(string_concat("tls: connect: ", e))
-    Ok(c)  -> {
-      let slot = raw_new(host, insecure)
-      if slot < 0 { NetTcp.close(c); Err("tls: SSL init failed") }
-      else { match handshake(c, slot) {
-        Err(e) -> { raw_free(slot); NetTcp.close(c); Err(e) }
-        Ok(_)  -> Ok(TlsConn { conn: c, slot: slot })
-      } }
+  if slot < 0 { Err(connect_error(slot)) }
+  else { match NetTcp.connect(host, port) {
+    Err(e) -> { raw_free(slot); Err(string_concat("tls: connect: ", e)) }
+    Ok(c)  -> match handshake(c, slot) {
+      Err(e) -> { raw_free(slot); NetTcp.close(c); Err(e) }
+      Ok(_)  -> Ok(TlsConn { conn: c, slot: slot })
     }
-  }
+  } }
+
+fn connect_error(code: Int) : String = match code {
+  -12 -> "tls: client certificate load failed"
+  -13 -> "tls: client private key load failed or mismatched"
+  _   -> "tls: SSL init failed"
+}
 
 #[doc("""
 Open a verified TLS connection to `host:port` over NetTcp. Resolves,
@@ -130,18 +138,43 @@ connects, and runs the TLS handshake with SNI and mandatory chain +
 hostname verification. `Err` names the failing layer.
 """)]
 pub fn connect(host: String, port: Int) : Result[String, TlsConn] / NetTcp + Ffi =
-  connect_impl(host, port, 0)
+  connect_over(host, port, raw_new(host, 0))
 
 #[doc("""
 Open a TLS connection WITHOUT certificate verification. The ugly name is
 deliberate — this defeats what TLS is for; only for a dev box with a
 self-signed cert, never production. SNI is sent and the channel is still
-encrypted, but a man in the middle is undetectable. Verification is a
-per-connection flag now, so this is safe alongside concurrent verified
-connects.
+encrypted, but a man in the middle is undetectable.
 """)]
 pub fn connect_insecure(host: String, port: Int) : Result[String, TlsConn] / NetTcp + Ffi =
-  connect_impl(host, port, 1)
+  connect_over(host, port, raw_new(host, 1))
+
+#[doc("""
+Open a verified TLS connection presenting a client certificate — the
+client half of mutual TLS. `cert_path` / `key_path` are PEM files; the
+server (if it requires mTLS) verifies them against its CA. Server
+verification is still mandatory: a client cert does not weaken it.
+
+If the server rejects the client cert (or a plain server demands one this
+client did not send), the handshake fails and the `Err` is generic — a
+client cannot tell "you sent no cert" from a transport error, because the
+server just aborts the handshake with a fatal alert.
+""")]
+pub fn connect_with_cert(host: String, port: Int, cert_path: String, key_path: String)
+    : Result[String, TlsConn] / NetTcp + Ffi =
+  connect_over(host, port, raw_new_with_cert(host, cert_path, key_path))
+
+#[doc("""
+Full mutual TLS: present a client certificate AND verify the server
+against a private CA (`ca_path`) instead of the system trust store. This
+is the org-CA case — both ends carry certs the other trusts through the
+same authority. Hostname verification against the server cert still
+applies; only the trust root is swapped, not the checking.
+""")]
+pub fn connect_with_cert_ca(host: String, port: Int,
+                            cert_path: String, key_path: String, ca_path: String)
+    : Result[String, TlsConn] / NetTcp + Ffi =
+  connect_over(host, port, raw_new_with_cert_ca(host, cert_path, key_path, ca_path))
 
 #[doc("""
 Send `data` (bytes, each in `[0, 255]`) over the connection. Encrypts via

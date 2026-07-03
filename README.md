@@ -46,9 +46,11 @@ moves the ciphertext. The module layout:
 
 - **`rongo.ffi.tls`** — the flat TLS engine. Client: `connect`, `send`,
   `recv`, `close` over the `TlsConn` handle, with the whole handshake
-  (DNS, TCP, TLS ≥ 1.2, SNI, chain + hostname verification). Server:
-  `listen` / `listen_mtls` bind a port with a certificate, `accept`
-  returns a `TlsConn` — same type, same pump, mirrored handshake.
+  (DNS, TCP, TLS ≥ 1.2, SNI, chain + hostname verification — including IP
+  SANs when the host is an address). `connect_with_cert` /
+  `connect_with_cert_ca` present a client certificate for mutual TLS.
+  Server: `listen` / `listen_mtls` bind a port with a certificate,
+  `accept` returns a `TlsConn` — same type, same pump, mirrored handshake.
 - **`rongo.tls`** — the `Tls` effect + `tls_wrap`. The effect ops carry
   pure data (`write` / `read` / `close`, no handle); the connection is
   the handler. A program can be tested against a mock handler with no
@@ -105,7 +107,7 @@ match tls.listen("127.0.0.1", 8443, "server.crt", "server.key") {
 ```
 
 See `examples/` for runnable versions (`https_get`, `https_post`,
-`https_concurrent`, `https_keepalive`, `tls_echo`).
+`https_concurrent`, `https_keepalive`, `tls_echo`, `mtls`).
 
 ## Build
 
@@ -119,8 +121,9 @@ make example            # examples/https_get         (live GET)
 make example-post       # examples/https_post        (live POST, large body)
 make example-concurrent # examples/https_concurrent  (two overlapping requests)
 make example-keepalive  # examples/https_keepalive   (3 requests, 1 connection)
-make certs              # self-signed dev cert for the server example
+make certs              # dev CA + server/client certs for the TLS examples
 make example-server     # examples/tls_echo          (TLS server + client, one process)
+make example-mtls       # examples/mtls              (mutual TLS, both halves rongo)
 make test               # tests (pure parsers + effect mock, no network)
 ```
 
@@ -129,8 +132,10 @@ mock handler — the runner installs no `Ffi` capability, so a test block
 cannot drive the real OpenSSL path. That path is exercised by the
 runnable examples: `https_post`'s >16 KB body spans several TLS records,
 `https_concurrent` proves one request does not block another,
-`https_keepalive` proves a connection is reused across requests, and
-`tls_echo` runs rongo's own server and client against each other.
+`https_keepalive` proves a connection is reused across requests,
+`tls_echo` runs rongo's own server and client against each other, and
+`mtls` closes the mutual-TLS loop (client cert accepted, no-cert
+rejected) — both halves rongo, no network.
 
 Requires OpenSSL 3.x / 4.x or LibreSSL (the shim uses only the stable
 high-level API; hostname verification binds `SSL_set1_dnsname` on 4.0,
