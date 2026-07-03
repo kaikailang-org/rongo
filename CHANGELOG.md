@@ -1,3 +1,9 @@
+## v0.3.0 (2026-07-02)
+
+### Feat
+
+- **tls**: serve TLS — listen/accept + mutual TLS
+
 ## v0.2.0 (2026-07-02)
 
 ### Feat
