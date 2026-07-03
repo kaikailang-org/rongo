@@ -1,3 +1,9 @@
+## v0.6.0 (2026-07-03)
+
+### Feat
+
+- **pool**: client connection pool over the https lane
+
 ## v0.5.0 (2026-07-03)
 
 ### Feat
