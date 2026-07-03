@@ -13,17 +13,36 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: macos-latest
+    # arm64 explicitly: the kaikai release we install is darwin-arm64, so pin
+    # an Apple-silicon runner rather than macos-latest, whose arch could shift.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install OpenSSL 4 and kaikai
+      - name: Install OpenSSL 4
+        run: brew install openssl@4
+
+      # kaikai ships as a GitHub release tarball. We fetch it directly rather
+      # than via `brew tap kaikailang-org/kaikai`, because Homebrew refuses to
+      # load a formula from an untrusted third-party tap in CI. The tarball is
+      # self-contained — `kai` resolves its stdlib relative to its own path —
+      # so extracting it and adding bin/ to PATH is all that's needed. Pin the
+      # version and verify the sha256 (the value the Homebrew formula used).
+      - name: Install kaikai (release tarball)
+        env:
+          KAIKAI_VERSION: "0.98.0"
+          KAIKAI_SHA256: "96380ececfee0f72a73fe6be33b83f7a5f66da97fe86cab107ccf6a13854da4f"
         run: |
-          brew update
-          brew install openssl@4
-          brew tap kaikailang-org/kaikai
-          brew install kaikai
-          kai --version
+          tarball="kaikai-v${KAIKAI_VERSION}-darwin-arm64.tar.gz"
+          url="https://github.com/kaikailang-org/kaikai/releases/download/v${KAIKAI_VERSION}/${tarball}"
+          curl -fsSL -o "$tarball" "$url"
+          echo "${KAIKAI_SHA256}  ${tarball}" | shasum -a 256 -c -
+          mkdir -p "$HOME/kaikai"
+          tar xzf "$tarball" -C "$HOME/kaikai"
+          echo "$HOME/kaikai/kaikai-v${KAIKAI_VERSION}-darwin-arm64/bin" >> "$GITHUB_PATH"
+
+      - name: Verify kaikai
+        run: kai --version
 
       - name: Unit tests (pure parsers + effect mock)
         run: make test
