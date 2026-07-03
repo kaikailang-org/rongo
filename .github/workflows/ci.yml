@@ -54,6 +54,14 @@ jobs:
           ./build/https_keepalive | tee /tmp/ka.out
           grep -q "1 connection, 1 handshake" /tmp/ka.out
 
+      - name: Connection pool — many requests reuse pooled connections
+        timeout-minutes: 1
+        run: |
+          make example-pool
+          ./build/https_pool | tee /tmp/pool.out
+          grep -q "connections reused and reaped" /tmp/pool.out
+          grep -c "n=1 -> 200" /tmp/pool.out
+
       - name: TLS server — rongo's server and client, one process (no network)
         timeout-minutes: 1
         run: |

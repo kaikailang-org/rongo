@@ -34,7 +34,7 @@ SHIM := ffi/tls_openssl.c
 KAI_CFLAGS := -std=c99 -O2 -Wall $(OPENSSL_CFLAGS) $(SHIM) $(OPENSSL_LIBS)
 
 .PHONY: all demo test example example-post example-concurrent example-keepalive \
-        example-server example-mtls example-http-server certs clean check-openssl
+        example-pool example-server example-mtls example-http-server certs clean check-openssl
 
 # The `openssl` CLI from the same install pkg-config resolves.
 OPENSSL_BIN := $(shell $(PKG_ENV) pkg-config --variable=prefix openssl)/bin/openssl
@@ -89,7 +89,7 @@ build/rongo: rongo.kai https.kai tls.kai ffi/tls.kai $(SHIM) | build
 # the manifest for the build and restores it after.
 #
 # build_example: $1 = entry .kai path, $2 = output binary.
-LIB_SRCS := https.kai http_server.kai tls.kai ffi/tls.kai $(SHIM)
+LIB_SRCS := https.kai http_server.kai pool.kai tls.kai ffi/tls.kai $(SHIM)
 
 define build_example
 	cp kai.toml kai.toml.bak
@@ -116,6 +116,11 @@ build/https_concurrent: examples/https_concurrent/main.kai $(LIB_SRCS) | build
 example-keepalive: build/https_keepalive
 build/https_keepalive: examples/https_keepalive/main.kai $(LIB_SRCS) | build
 	$(call build_example,examples/https_keepalive/main.kai,$@)
+
+# Connection pool: many requests, connections reused and reaped automatically.
+example-pool: build/https_pool
+build/https_pool: examples/https_pool/main.kai $(LIB_SRCS) | build
+	$(call build_example,examples/https_pool/main.kai,$@)
 
 # The 0.3.0 gate: a TLS server and rongo's own client, echo end to end.
 # Needs the dev cert (`make certs`).
