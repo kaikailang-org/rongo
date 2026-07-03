@@ -32,13 +32,13 @@ advanced networking (system-dependency-carrying) here.
 
 ## Status
 
-The TLS lane works both ways: `https://` client end to end, and a TLS
-server — over OpenSSL, non-blocking, with keep-alive and mutual TLS. TLS
-runs over kaikai's reactor-aware `NetTcp`, so a request in flight yields
-the fiber instead of freezing the thread; two requests overlap, a
-`Session` reuses one connection across requests, and an accept loop serves
-concurrent connections. What comes after — an HTTP server, HTTP/2 — is in
-[ROADMAP.md](ROADMAP.md).
+rongo speaks HTTPS on both sides: an `https://` client and an HTTP server,
+over OpenSSL, non-blocking, with keep-alive and mutual TLS. TLS runs over
+kaikai's reactor-aware `NetTcp`, so a request in flight yields the fiber
+instead of freezing the thread; two requests overlap, a `Session` reuses
+one connection across requests, and the server's accept loop serves
+concurrent connections each on its own fiber. What comes after — a read
+timeout, request routing, HTTP/2 — is in [ROADMAP.md](ROADMAP.md).
 
 The architecture is the Rustls / Go `crypto/tls` split: OpenSSL runs the
 TLS state machine over memory BIOs and never touches a socket; `NetTcp`
@@ -55,12 +55,17 @@ moves the ciphertext. The module layout:
   pure data (`write` / `read` / `close`, no handle); the connection is
   the handler. A program can be tested against a mock handler with no
   network and no OpenSSL.
-- **`rongo.https`** — HTTP/1.1 over TLS: `get` / `post` / `put` /
+- **`rongo.https`** — HTTP/1.1 client over TLS: `get` / `post` / `put` /
   `delete` / `request` (one connection per request), plus `open_session`
   / `session_get` / `close_session` for keep-alive (many requests, one
   connection). Reuses net.http's parser; frames responses by
   Content-Length / chunked so keep-alive does not depend on the peer
   closing.
+- **`rongo.http_server`** — HTTP/1.1 server over TLS: `serve(listener,
+  handler)` where `handler : (Request) -> Response / e` runs in whatever
+  effect row it needs. Concurrent (each connection on its own fiber),
+  keep-alive, graceful shutdown on cancel. No read timeout yet — run it
+  behind a trusted network or a proxy (see ROADMAP).
 
 Verification is always on. A dev-only escape hatch,
 `tls.connect_insecure`, skips it — the deliberately ugly name is the
@@ -90,24 +95,25 @@ match https.open_session("example.com", 443) {
 }
 ```
 
-A TLS server (`tls.listen_mtls` is the same, plus a CA to verify clients):
+An HTTPS server — a handler over a TLS listener:
 
 ```kaikai
+fn handler(req: http.Request) : http.Response = http.Response {
+  status: 200, headers: [], body: "hello from #{req.url}"
+}
+
 match tls.listen("127.0.0.1", 8443, "server.crt", "server.key") {
-  Ok(l) -> match tls.accept(l) {          # parks the fiber until a client arrives
-    Ok(c) -> {
-      let msg = tls.recv(c, 4096)
-      # ... handle, then tls.send(c, reply) ...
-      tls.close(c)
-    }
-    Err(e) -> print(e)
-  }
+  Ok(l)  -> http_server.serve(l, handler)   # concurrent, keep-alive; cancel to stop
   Err(e) -> print(e)
 }
 ```
 
+The handler may carry effects (`(Request) -> Response / e`) — log, read
+files, query a DB — and `serve` threads that row through. For raw TLS
+(not HTTP), `tls.accept` returns a `TlsConn` to `recv` / `send` directly.
+
 See `examples/` for runnable versions (`https_get`, `https_post`,
-`https_concurrent`, `https_keepalive`, `tls_echo`, `mtls`).
+`https_concurrent`, `https_keepalive`, `tls_echo`, `mtls`, `http_server`).
 
 ## Build
 
@@ -124,6 +130,7 @@ make example-keepalive  # examples/https_keepalive   (3 requests, 1 connection)
 make certs              # dev CA + server/client certs for the TLS examples
 make example-server     # examples/tls_echo          (TLS server + client, one process)
 make example-mtls       # examples/mtls              (mutual TLS, both halves rongo)
+make example-http-server # examples/http_server      (HTTPS server + client, keep-alive)
 make test               # tests (pure parsers + effect mock, no network)
 ```
 

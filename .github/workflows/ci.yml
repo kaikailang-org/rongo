@@ -71,3 +71,14 @@ jobs:
           ./build/mtls | tee /tmp/mtls.out
           grep -q "mtls client got: hello over mtls" /tmp/mtls.out
           grep -q "no-cert client rejected: yes" /tmp/mtls.out
+
+      - name: HTTP server — keep-alive, and a crashing handler is isolated to a 500
+        timeout-minutes: 1
+        run: |
+          make certs
+          make example-http-server
+          ./build/http_server | tee /tmp/httpsrv.out
+          grep -q "normal request:       200" /tmp/httpsrv.out
+          grep -q "crashing request:     500" /tmp/httpsrv.out
+          grep -q "request after crash:  200" /tmp/httpsrv.out
+          grep -q "server stopped cleanly" /tmp/httpsrv.out

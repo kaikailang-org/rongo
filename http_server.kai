@@ -1,0 +1,343 @@
+#[doc("""
+An HTTPS server: `serve` a `TlsListener` with a request handler.
+`import rongo.http_server`, reached qualified (`http_server.serve(...)`).
+
+This is the server dual of `rongo.https`. It reuses net.http's pure
+request parser and response serialiser, supplies a request read-loop over
+the TLS connection (framing by Content-Length / chunked, like the client's
+response reader), and runs an accept loop where each connection is handled
+on its own fiber.
+
+Shape: `serve(listener, handler)` where `handler : (Request) -> Response`
+in whatever effect row the handler needs — read files, log, query a DB.
+`serve` is polymorphic in that row, so the handler's effects flow through
+unchanged. The accept loop lives in an internal nursery, so it serves
+connections concurrently and shuts down cleanly when the caller's fiber is
+cancelled (the nursery cancels every in-flight connection on scope exit).
+
+Keep-alive is on: a connection serves requests until the client sends
+`Connection: close`, the handler answers with one, or the peer closes.
+`Config.max_connections` caps concurrency. Chunked request bodies are
+refused with 411 (not decoded).
+
+Handler failure: a handler that `Cancel.raise`s fails its one request with
+a 500 — the server keeps serving. But a handler that hits a runtime TRAP
+(array out-of-bounds, division by zero, non-exhaustive match) calls exit(1)
+and kills the whole server process — the runtime routes traps past both the
+guard and the nursery, and a user package cannot catch that. Handlers MUST
+NOT trap: validate indices, guard divisors, keep matches exhaustive. (This
+is a kaikai runtime limit; fiber-level trap isolation is a ROADMAP item.)
+
+Caveat — no read timeout: a slow or idle client holds its fiber open until
+it closes (there is no way on this runtime to time out a fiber parked in
+the reactor). Run behind a trusted network or a reverse proxy that enforces
+timeouts. See `read_request` and the ROADMAP.
+""")]
+
+import net.http
+import net.tcp
+import rongo.ffi.tls
+import spawn
+
+#[doc("""
+Server configuration. `max_request_bytes` caps how much one request may
+buffer (a header/body flood defense); `max_connections` caps how many
+connections are served at once — a new accept past the cap is closed
+immediately, so a flood of idle connections cannot exhaust the fiber /
+TLS-slot supply (the crude defense that stands in for the missing read
+timeout); `keep_alive` off closes after one request per connection.
+""")]
+pub type Config = {
+  max_request_bytes: Int,
+  max_connections: Int,
+  keep_alive: Bool,
+}
+
+#[doc("Sensible defaults: 1 MiB request cap, 64 concurrent connections, keep-alive on.")]
+pub fn default_config() : Config = Config {
+  max_request_bytes: 1048576,
+  max_connections: 64,
+  keep_alive: true,
+}
+
+# ---- request read-loop over TLS -----------------------------------
+#
+# Read one complete HTTP/1.1 request off the TLS connection, framed by the
+# request line + headers + a body sized by Content-Length (or none). Reuses
+# net.http's parse_request for the final parse; the completeness check here
+# mirrors the client's response reader.
+
+# Outcome of a single read attempt.
+type ReadResult = ReadOk(http.Request) | ReadClosed | ReadError(String) | ReadUnsupported
+
+# Accumulate bytes until a full request has arrived (or the byte cap /
+# close fires), then parse it.
+#
+# NO read timeout. The natural build — race recv against a Clock timer with
+# Spawn.select — does not work: Spawn.select is a Phase-2 stub that parks on
+# the head of the fiber array instead of returning the first to finish, so a
+# recv racing a timer waits for the recv (forever, for an idle client), never
+# the timer. Cancellation itself is fine (the runtime does unpark a fiber
+# parked on recv or a timer), but without a real select there is no
+# "first-of-two", and await-on-one can't provide it. The clean fix is a
+# native NetTcp.recv with a deadline (the runtime already has the
+# dual-park-with-deadline that Actor.receive_timeout uses). Until then this
+# server has NO defense against a slow/idle client holding a fiber open — run
+# it behind a trusted network or a reverse proxy that enforces timeouts.
+fn read_request(c: tls.TlsConn, cfg: Config)
+    : ReadResult / NetTcp + Ffi =
+  read_request_loop(c, cfg, [], 0)
+
+fn read_request_loop(c: tls.TlsConn, cfg: Config, acc_rev: [Int], have: Int)
+    : ReadResult / NetTcp + Ffi = {
+  let raw = http.bytes_to_string(list_reverse(acc_rev))
+  if request_complete(raw) {
+    let head_end = find(raw, "\r\n\r\n")
+    let head     = if head_end < 0 { raw } else { string_slice(raw, 0, head_end) }
+    if is_chunked(head) { ReadUnsupported }    # chunked body: we can't frame it
+    else { match http.parse_request(raw) {
+      Ok(req) -> ReadOk(req)
+      Err(e)  -> ReadError(e)
+    } }
+  } else if have > cfg.max_request_bytes {
+    ReadError("request exceeds max_request_bytes")
+  } else { match tls.recv(c, 4096) {
+    Err(e)    -> ReadError(e)
+    Ok(chunk) -> match chunk {
+      [] -> if have == 0 { ReadClosed }        # clean close between requests
+            else { ReadError("peer closed mid-request") }
+      _  -> read_request_loop(c, cfg, prepend(chunk, acc_rev), have + list_length(chunk))
+    }
+  } }
+}
+
+fn prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
+  []           -> acc
+  [b, ...rest] -> prepend(rest, [b, ...acc])
+}
+
+# A request is complete once the header/body separator has arrived and the
+# body is fully present per Content-Length (a GET/HEAD with no body-framing
+# header completes at the blank line). A chunked request counts as
+# "complete" at the blank line too — not because its body is in, but so the
+# read loop stops and `handle_conn` can reject it: this server does not
+# decode chunked request bodies, and reading past the headers into an
+# undecoded chunked body would desync framing for the next keep-alive
+# request.
+pub fn request_complete(raw: String) : Bool = {
+  let sep = "\r\n\r\n"
+  let i   = find(raw, sep)
+  if i < 0 { false }
+  else {
+    let head       = string_slice(raw, 0, i)
+    let body_start  = i + string_length(sep)
+    let body_len    = string_length(raw) - body_start
+    if is_chunked(head) { true }               # stop here; handle_conn rejects it
+    else { match content_length(head) {
+      None    -> true                          # no body framing → done at blank line
+      Some(n) -> body_len >= n
+    } }
+  }
+}
+
+# Whether the header block declares `Transfer-Encoding: chunked`.
+pub fn is_chunked(head: String) : Bool = te_scan(string_split(head, "\r\n"))
+fn te_scan(lines: [String]) : Bool = match lines {
+  [] -> false
+  [l, ...rest] -> {
+    let i = find(l, ":")
+    if i < 0 { te_scan(rest) }
+    else if lower(string_slice(l, 0, i)) == "transfer-encoding" {
+      find(lower(string_slice(l, i + 1, string_length(l) - i - 1)), "chunked") >= 0
+    } else { te_scan(rest) }
+  }
+}
+
+# Pull Content-Length from the header block (case-insensitive name).
+fn content_length(head: String) : Option[Int] = {
+  let lines = string_split(head, "\r\n")
+  cl_scan(lines)
+}
+fn cl_scan(lines: [String]) : Option[Int] = match lines {
+  [] -> None
+  [l, ...rest] -> {
+    let i = find(l, ":")
+    if i < 0 { cl_scan(rest) }
+    else if lower(string_slice(l, 0, i)) == "content-length" {
+      string_to_int(trim(string_slice(l, i + 1, string_length(l) - i - 1)))
+    } else { cl_scan(rest) }
+  }
+}
+
+# ---- one connection -----------------------------------------------
+#
+# Serve requests on `c` until keep-alive ends. Each request: read, hand to
+# the handler, serialise, send. The handler carries its own effect row `e`.
+
+# A minimal error response, then close — for requests we won't serve.
+fn send_error(c: tls.TlsConn, status: Int, msg: String) : Unit / NetTcp + Ffi = {
+  let resp = http.Response {
+    status: status,
+    headers: [http.HttpHeader { name: "Connection", value: "close" }],
+    body: msg,
+  }
+  let _ = tls.send(c, http.string_to_bytes(http.serialize_response(resp)))
+  tls.close(c)
+}
+
+# Serve requests on `c`, decrementing the active-connection counter `live`
+# when the connection ends (any exit path). `active` is the counter serve
+# uses to enforce `max_connections`.
+fn handle_conn[e](c: tls.TlsConn, cfg: Config, live: Ref[Int],
+                  handler: (http.Request) -> http.Response / e)
+    : Unit / NetTcp + Ffi + Spawn + Mutable + e = {
+  serve_requests(c, cfg, handler)
+  Mutable.ref_set(live, Mutable.ref_get(live) - 1)             # connection done: free its slot
+}
+
+# The keep-alive request loop for one connection. Self-tail-recurses per
+# request; this relies on tail-call optimisation holding under an installed
+# effect handler (the accept loop runs it under a `Mutable` state handler),
+# a case the compiler docs flag as not-yet-guaranteed — verified here to
+# hold for thousands of requests on one connection. If a future kaikai
+# regresses TCO under handlers, rewrite this as an explicit `loop` iteration.
+fn serve_requests[e](c: tls.TlsConn, cfg: Config,
+                     handler: (http.Request) -> http.Response / e)
+    : Unit / NetTcp + Ffi + Spawn + e = {
+  match read_request(c, cfg) {
+    ReadClosed      -> tls.close(c)
+    ReadError(_)    -> tls.close(c)            # malformed / oversized: drop
+    # Chunked request bodies are not decoded; refuse rather than mis-frame
+    # (and close, since the undecoded body would corrupt the next request).
+    ReadUnsupported -> send_error(c, 411, "chunked request bodies not supported")
+    ReadOk(req)     -> {
+      let resp = run_handler(handler, req)
+      # Continue the connection only if config, client, AND handler all
+      # allow it — the handler may force close via its own Connection header.
+      let keep = cfg.keep_alive and not client_wants_close(req) and not handler_wants_close(resp)
+      let wire = http.serialize_response(with_connection_header(resp, keep))
+      let _    = tls.send(c, http.string_to_bytes(wire))
+      if keep { serve_requests(c, cfg, handler) }   # next request, same conn
+      else { tls.close(c) }
+    }
+  }
+}
+
+# Run the handler, turning a `Cancel.raise` (an application-level failure)
+# into a 500 instead of letting it unwind the connection fiber and, through
+# the nursery, the whole server. This covers ONLY `Cancel.raise`. A runtime
+# TRAP in the handler — array out-of-bounds, division by zero, a
+# non-exhaustive match — calls exit(1) at the runtime level, killing the
+# whole server process, bypassing both this handler and the nursery. There
+# is no way to catch that from a user package. Handlers MUST NOT trap.
+fn run_handler[e](handler: (http.Request) -> http.Response / e, req: http.Request)
+    : http.Response / e =
+  handle { handler(req) } with Cancel {
+    raise(resume) -> http.Response {
+      status: 500,
+      headers: [http.HttpHeader { name: "Connection", value: "close" }],
+      body: "internal server error",
+    }
+  }
+
+# Does the client ask to close (`Connection: close`)?
+fn client_wants_close(req: http.Request) : Bool =
+  match http.header_lookup(req.headers, "Connection") {
+    Some(v) -> lower(trim(v)) == "close"
+    None    -> false
+  }
+
+# Set the response's Connection header to match what the server will do,
+# dropping any Connection the handler already set so the wire never carries
+# two (a client reading the first would disagree with the server's intent).
+fn with_connection_header(resp: http.Response, keep: Bool) : http.Response = {
+  let val = if keep { "keep-alive" } else { "close" }
+  let others = list.filter(resp.headers, (h) => lower(h.name) != "connection")
+  http.Response {
+    status: resp.status,
+    headers: [http.HttpHeader { name: "Connection", value: val }, ...others],
+    body: resp.body,
+  }
+}
+
+# Whether the handler's own response asked to close the connection.
+fn handler_wants_close(resp: http.Response) : Bool =
+  match http.header_lookup(resp.headers, "Connection") {
+    Some(v) -> lower(trim(v)) == "close"
+    None    -> false
+  }
+
+# ---- accept loop --------------------------------------------------
+
+#[doc("""
+Serve `listener` with `handler` until this fiber is cancelled. Each
+accepted connection is handled on its own fiber inside an internal nursery,
+so connections are concurrent and a cancel (e.g. Ctrl-C) unwinds `serve`
+and cancels every in-flight connection. `serve` never returns normally —
+it loops accepting; cancel it to stop.
+
+The handler's effect row `e` flows through unchanged, so a handler may read
+files, log, or perform any effect the caller installs a handler for.
+""")]
+pub fn serve[e](l: tls.TlsListener, handler: (http.Request) -> http.Response / e)
+    : Unit / NetTcp + Ffi + Spawn + Mutable + e =
+  serve_with(l, default_config(), handler)
+
+#[doc("Like `serve`, with an explicit `Config` (request cap, connection cap, keep-alive).")]
+pub fn serve_with[e](l: tls.TlsListener, cfg: Config,
+                     handler: (http.Request) -> http.Response / e)
+    : Unit / NetTcp + Ffi + Spawn + Mutable + e = {
+  # `live` counts connections currently being served, so the accept loop can
+  # cap concurrency. The nursery scope owns every connection fiber: on cancel
+  # it joins / cancels them all, so `serve` shuts down cleanly.
+  let live = Mutable.ref_make(0)
+  nursery { accept_loop(l, cfg, live, handler) }
+}
+
+fn accept_loop[e](l: tls.TlsListener, cfg: Config, live: Ref[Int],
+                  handler: (http.Request) -> http.Response / e)
+    : Unit / NetTcp + Ffi + Spawn + Mutable + e = {
+  match tls.accept(l) {
+    Err(_) -> accept_loop(l, cfg, live, handler)   # failed handshake: skip, keep serving
+    Ok(c)  -> {
+      if Mutable.ref_get(live) >= cfg.max_connections {
+        # At capacity: drop the connection immediately rather than spawn a
+        # fiber for it. A flood of connections can't outgrow the cap.
+        tls.close(c)
+      } else {
+        Mutable.ref_set(live, Mutable.ref_get(live) + 1)
+        let _ = Spawn.spawn(() => handle_conn(c, cfg, live, handler))
+      }
+      accept_loop(l, cfg, live, handler)
+    }
+  }
+}
+
+# ---- local string helpers (mirror https.kai's) --------------------
+
+fn find(hay: String, needle: String) : Int =
+  find_loop(hay, needle, 0, string_length(hay), string_length(needle))
+fn find_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int =
+  if nn == 0 { 0 }
+  else if i + nn > hn { 0 - 1 }
+  else if string_slice(hay, i, nn) == needle { i }
+  else { find_loop(hay, needle, i + 1, hn, nn) }
+
+fn lower(s: String) : String = string_concat_all(list.map(char_list(s), lower_char))
+fn lower_char(c: Char) : String = if c >= 'A' and c <= 'Z' { "#{int_to_char(char_to_int(c) + 32)}" } else { "#{c}" }
+fn char_list(s: String) : [Char] = char_list_loop(s, 0, string_length(s), [])
+fn char_list_loop(s: String, i: Int, n: Int, acc: [Char]) : [Char] =
+  if i >= n { list_reverse(acc) }
+  else { match char_at(s, i) { Some(c) -> char_list_loop(s, i + 1, n, [c, ...acc])  None -> list_reverse(acc) } }
+
+fn trim(s: String) : String = {
+  let n = string_length(s)
+  let lo = ltrim(s, 0, n)
+  let hi = rtrim(s, n)
+  if hi <= lo { "" } else { string_slice(s, lo, hi - lo) }
+}
+fn is_ws(c: Char) : Bool = c == ' ' or c == '\t' or c == '\r' or c == '\n'
+fn ltrim(s: String, i: Int, n: Int) : Int =
+  if i >= n { i } else { match char_at(s, i) { Some(c) -> if is_ws(c) { ltrim(s, i + 1, n) } else { i }  None -> i } }
+fn rtrim(s: String, i: Int) : Int =
+  if i <= 0 { 0 } else { match char_at(s, i - 1) { Some(c) -> if is_ws(c) { rtrim(s, i - 1) } else { i }  None -> i } }

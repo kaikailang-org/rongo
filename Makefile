@@ -34,7 +34,7 @@ SHIM := ffi/tls_openssl.c
 KAI_CFLAGS := -std=c99 -O2 -Wall $(OPENSSL_CFLAGS) $(SHIM) $(OPENSSL_LIBS)
 
 .PHONY: all demo test example example-post example-concurrent example-keepalive \
-        example-server example-mtls certs clean check-openssl
+        example-server example-mtls example-http-server certs clean check-openssl
 
 # The `openssl` CLI from the same install pkg-config resolves.
 OPENSSL_BIN := $(shell $(PKG_ENV) pkg-config --variable=prefix openssl)/bin/openssl
@@ -89,7 +89,7 @@ build/rongo: rongo.kai https.kai tls.kai ffi/tls.kai $(SHIM) | build
 # the manifest for the build and restores it after.
 #
 # build_example: $1 = entry .kai path, $2 = output binary.
-LIB_SRCS := https.kai tls.kai ffi/tls.kai $(SHIM)
+LIB_SRCS := https.kai http_server.kai tls.kai ffi/tls.kai $(SHIM)
 
 define build_example
 	cp kai.toml kai.toml.bak
@@ -128,6 +128,12 @@ build/tls_echo: examples/tls_echo/main.kai $(LIB_SRCS) | build
 example-mtls: build/mtls
 build/mtls: examples/mtls/main.kai $(LIB_SRCS) | build
 	$(call build_example,examples/mtls/main.kai,$@)
+
+# The 0.5.0 gate: an HTTPS server (serve + handler) and rongo's own client
+# over one keep-alive connection, both in one process. Needs `make certs`.
+example-http-server: build/http_server
+build/http_server: examples/http_server/main.kai $(LIB_SRCS) http_server.kai | build
+	$(call build_example,examples/http_server/main.kai,$@)
 
 # Package tests: pure parsers + the effect mock (no network) run under
 # `kai test`; the shim is linked so the FFI externs resolve.

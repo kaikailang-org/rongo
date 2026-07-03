@@ -35,6 +35,7 @@ pub type TlsConn = { priv conn: tcp.Conn, priv slot: Int }
 # Returns a slot >= 0, or negative on error.
 extern "C"("kai_tls_new")           fn raw_new(host: String, insecure: Int) : Int / Ffi
 extern "C"("kai_tls_new_with_cert") fn raw_new_with_cert(host: String, cert: String, key: String) : Int / Ffi
+extern "C"("kai_tls_new_ca")           fn raw_new_ca(host: String, ca: String) : Int / Ffi
 extern "C"("kai_tls_new_with_cert_ca") fn raw_new_with_cert_ca(host: String, cert: String, key: String, ca: String) : Int / Ffi
 extern "C"("kai_tls_free")          fn raw_free(slot: Int) : Unit / Ffi
 # Ciphertext transport: take pending outgoing (hex, "" if none) / feed incoming (hex).
@@ -129,6 +130,7 @@ fn connect_over(host: String, port: Int, slot: Int)
 fn connect_error(code: Int) : String = match code {
   -12 -> "tls: client certificate load failed"
   -13 -> "tls: client private key load failed or mismatched"
+  -14 -> "tls: CA file load failed"
   _   -> "tls: SSL init failed"
 }
 
@@ -148,6 +150,16 @@ encrypted, but a man in the middle is undetectable.
 """)]
 pub fn connect_insecure(host: String, port: Int) : Result[String, TlsConn] / NetTcp + Ffi =
   connect_over(host, port, raw_new(host, 1))
+
+#[doc("""
+Open a verified TLS connection, trusting a private CA (`ca_path`) instead
+of the system trust store — for a server with an org or self-signed cert
+the caller explicitly trusts. Verifies the chain and hostname against that
+CA; presents no client certificate.
+""")]
+pub fn connect_ca(host: String, port: Int, ca_path: String)
+    : Result[String, TlsConn] / NetTcp + Ffi =
+  connect_over(host, port, raw_new_ca(host, ca_path))
 
 #[doc("""
 Open a verified TLS connection presenting a client certificate — the
@@ -248,8 +260,9 @@ pub type TlsListener = { priv tcp_l: tcp.Listener, priv slot: Int }
 fn listener_error(code: Int) : String = match code {
   -10 -> "tls: listener table full"
   -11 -> "tls: server context allocation failed"
-  -12 -> "tls: certificate/CA load failed"
+  -12 -> "tls: server certificate load failed"
   -13 -> "tls: private key load failed or mismatched"
+  -14 -> "tls: client-CA file load failed (mTLS)"
   _   -> "tls: listener error (code #{int_to_string(code)})"
 }
 
