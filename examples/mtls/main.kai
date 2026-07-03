@@ -1,0 +1,92 @@
+#[doc("""
+Mutual TLS, both halves rongo's own — 0.4.0 closing the circle. The
+server requires a client certificate (`listen_mtls`); the client presents
+one (`connect_with_cert`). Then the same server is hit by a client with NO
+certificate, and the handshake is rejected — proving the requirement is
+enforced, not cosmetic.
+
+Both the mTLS handshake and the rejection run in one process against
+rongo's own server, over the reactor. Needs the dev CA + certs:
+  make certs && make example-mtls && ./build/mtls
+
+The server binds once up front (so the port is open before either client
+fiber connects), accepts twice, and echoes each.
+""")]
+
+import rongo.ffi.tls
+import net.http
+import spawn
+
+const PORT : Int = 8445
+# The client connects by name, matched against the cert's "localhost" DNS
+# SAN; "127.0.0.1" would work too — the client checks an IP literal against
+# the cert's IP SANs. getaddrinfo resolves the name to where the server binds.
+const CLIENT_HOST : String = "localhost"
+
+# Accept one connection, echo a chunk, close. Returns what it read, or the
+# error (a rejected mTLS handshake surfaces here).
+fn accept_one(l: tls.TlsListener) : Result[String, String] / NetTcp + Ffi =
+  match tls.accept(l) {
+    Err(e) -> Err(e)
+    Ok(c)  -> match tls.recv(c, 4096) {
+      Err(e) -> { tls.close(c); Err(e) }
+      Ok(bs) -> { let _ = tls.send(c, bs); tls.close(c); Ok(http.bytes_to_string(bs)) }
+    }
+  }
+
+# Client presenting its certificate AND trusting the dev CA to verify the
+# server — the full mTLS path, both ends anchored to the same authority.
+fn client_with_cert(msg: String) : Result[String, String] / NetTcp + Ffi =
+  match tls.connect_with_cert_ca(CLIENT_HOST, PORT,
+                                 "test-certs/client.crt", "test-certs/client.key",
+                                 "test-certs/ca.crt") {
+    Err(e) -> Err(e)
+    Ok(c)  -> {
+      let _ = tls.send(c, http.string_to_bytes(msg))
+      let r = match tls.recv(c, 4096) { Ok(bs) -> Ok(http.bytes_to_string(bs))  Err(e) -> Err(e) }
+      tls.close(c)
+      r
+    }
+  }
+
+# Client with NO certificate — the server must reject it.
+fn client_no_cert() : Result[String, String] / NetTcp + Ffi =
+  match tls.connect_insecure(CLIENT_HOST, PORT) {
+    Err(e) -> Err(e)                         # handshake refused: expected
+    Ok(c)  -> {
+      let _ = tls.send(c, http.string_to_bytes("no cert"))
+      let r = match tls.recv(c, 4096) { Ok(bs) -> Ok(http.bytes_to_string(bs))  Err(e) -> Err(e) }
+      tls.close(c)
+      r
+    }
+  }
+
+fn main() : Unit / Console + NetTcp + Ffi + Spawn = {
+  match tls.listen_mtls("127.0.0.1", PORT,
+                        "test-certs/server.crt", "test-certs/server.key",
+                        "test-certs/ca.crt") {
+    Err(e) -> print("listen_mtls ERROR: #{e}")
+    Ok(l)  -> {
+      # Round 1: a client WITH a valid cert. Server accept + client connect
+      # overlap on the reactor.
+      let ok = nursery { n ->
+        let srv = n.spawn(() => accept_one(l))
+        let cli = n.spawn(() => client_with_cert("hello over mtls"))
+        (n.await(srv), n.await(cli))
+      }
+      match ok.fst { Ok(s)  -> print("mtls server saw: #{s}")  Err(e) -> print("server(1): #{e}") }
+      match ok.snd { Ok(s)  -> print("mtls client got: #{s}")  Err(e) -> print("client(1): #{e}") }
+
+      # Round 2: a client with NO cert — both sides should report failure.
+      let bad = nursery { n ->
+        let srv = n.spawn(() => accept_one(l))
+        let cli = n.spawn(() => client_no_cert())
+        (n.await(srv), n.await(cli))
+      }
+      let rejected = match bad.fst { Err(_) -> true  Ok(_) -> false }
+      print("no-cert client rejected: #{if rejected { "yes" } else { "NO — mTLS not enforced!" }}")
+
+      tls.close_listener(l)
+    }
+  }
+}

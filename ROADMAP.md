@@ -20,16 +20,21 @@ most-wanted first.
   and client share one `TlsConn` type, two constructors. The accept loop
   runs on the reactor, so it can serve concurrent connections under
   `Spawn`.
+- **0.4.0** — client certificates, closing the mutual-TLS loop:
+  `connect_with_cert` presents a client cert (verifying the server against
+  the system trust store), `connect_with_cert_ca` also swaps the trust
+  root for a private CA — both loaded per-connection on the SSL object via
+  an `X509_STORE`, no shared-context mutation. rongo's own client and
+  server now speak mTLS to each other end to end. Also fixed: connecting
+  to a bare IP literal now verifies against the cert's IP SANs (was
+  checking the IP as a DNS name and failing).
 
-## 1. Client certificates + the HTTP server framework
+## 1. HTTP server framework
 
-Two loose ends from 0.3.0. The **client** can't yet present a certificate,
-so it can't be the client half of an mTLS connection to a server that
-requires one — add a cert/key to `connect`. And the server side today is
-raw TLS (accept + read/write plaintext); an **HTTP server** on top —
-`serve(listener, handler)` reusing net.http's `parse_request` /
-`serialize_response`, with a serve loop and server-side keep-alive — is
-its own release-worth of design.
+The server side today is raw TLS (accept + read/write plaintext). An
+**HTTP server** on top — `serve(listener, handler)` reusing net.http's
+`parse_request` / `serialize_response`, with a serve loop and server-side
+keep-alive — is its own release-worth of design.
 
 ## 2. Connection pooling + dead-connection detection
 

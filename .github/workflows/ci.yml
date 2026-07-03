@@ -62,3 +62,12 @@ jobs:
           ./build/tls_echo | tee /tmp/echo.out
           grep -q "server saw: hello over tls" /tmp/echo.out
           grep -q "client got: hello over tls" /tmp/echo.out
+
+      - name: Mutual TLS — rongo client cert against rongo server, and reject no-cert
+        timeout-minutes: 1
+        run: |
+          make certs
+          make example-mtls
+          ./build/mtls | tee /tmp/mtls.out
+          grep -q "mtls client got: hello over mtls" /tmp/mtls.out
+          grep -q "no-cert client rejected: yes" /tmp/mtls.out

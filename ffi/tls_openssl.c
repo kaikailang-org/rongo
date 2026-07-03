@@ -26,6 +26,8 @@
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 
+#include <arpa/inet.h>   /* inet_pton — distinguish IP literal from DNS name */
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,10 +38,28 @@
  * SSL_set1_dnsname (deprecating the old name); 3.x and LibreSSL only
  * have SSL_set1_host. Bind whichever the toolchain ships. */
 #if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x40000000L
-#define KAI_TLS_SET_HOST(ssl, host) SSL_set1_dnsname((ssl), (host))
+#define KAI_TLS_SET_DNSNAME(ssl, host) SSL_set1_dnsname((ssl), (host))
 #else
-#define KAI_TLS_SET_HOST(ssl, host) SSL_set1_host((ssl), (host))
+#define KAI_TLS_SET_DNSNAME(ssl, host) SSL_set1_host((ssl), (host))
 #endif
+
+/* Whether `host` is an IP literal (v4 or v6) rather than a DNS name. */
+static int host_is_ip(const char *host) {
+  unsigned char buf[16];   /* fits both AF_INET (4) and AF_INET6 (16) */
+  return inet_pton(AF_INET, host, buf) == 1 || inet_pton(AF_INET6, host, buf) == 1;
+}
+
+/* Arm certificate name-checking for `host`. A DNS name checks against the
+ * cert's DNS SANs; an IP literal must check against IP SANs instead, so we
+ * route it to set1_ip_asc — otherwise a cert with only an IP SAN fails
+ * verification when reached by its address (a service mesh / container /
+ * `127.0.0.1` test cert case). Returns 1 on success, 0 on failure. */
+static int kai_tls_set_verify_name(SSL *ssl, const char *host) {
+  if (host_is_ip(host)) {
+    return X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host);
+  }
+  return KAI_TLS_SET_DNSNAME(ssl, host);
+}
 
 /* tls_step / write / read status codes returned to the kaikai driver.
  * The driver loops on WANT_*: drain outgoing ciphertext to NetTcp, or
@@ -240,11 +260,17 @@ static int wire_slot(int idx, SSL *ssl) {
   return 0;
 }
 
-/* Create an SSL client object wired to a fresh pair of memory BIOs, set
- * up SNI + verification, and start the handshake state machine. Returns
- * a slot, or a negative error. `host` drives SNI and hostname
- * verification; `insecure != 0` skips verification (per-connection). */
-int64_t kai_tls_new(const char *host, int64_t insecure) {
+/* Create an SSL client object wired to a fresh pair of memory BIOs, set up
+ * SNI + verification, and start the handshake. Returns a slot, or a
+ * negative error. `host` drives SNI and hostname verification;
+ * `insecure != 0` skips verification. Optional per-connection extras,
+ * all loaded on the SSL object so the shared client ctx stays untouched:
+ *   - `cert_file`/`key_file`: present a client certificate (mTLS).
+ *   - `ca_file`: verify the server against THIS CA instead of the system
+ *     trust store (a private/org CA) — via a per-connection X509_STORE. */
+static int64_t client_new(const char *host, int insecure,
+                          const char *cert_file, const char *key_file,
+                          const char *ca_file) {
   int idx = slot_alloc();
   if (idx < 0) { return KAI_TLS_ERR_SLOT; }
 
@@ -254,20 +280,65 @@ int64_t kai_tls_new(const char *host, int64_t insecure) {
   SSL *ssl = SSL_new(ctx);
   if (ssl == NULL) { return KAI_TLS_ERR_SSL; }
 
+  if (cert_file != NULL) {
+    if (SSL_use_certificate_chain_file(ssl, cert_file) != 1) {
+      SSL_free(ssl); return KAI_TLS_ERR_CERT;
+    }
+    if (SSL_use_PrivateKey_file(ssl, key_file, SSL_FILETYPE_PEM) != 1) {
+      SSL_free(ssl); return KAI_TLS_ERR_KEY;
+    }
+    if (SSL_check_private_key(ssl) != 1) {
+      SSL_free(ssl); return KAI_TLS_ERR_KEY;
+    }
+  }
+
+  if (ca_file != NULL) {
+    /* Trust exactly this CA for the server chain, per-connection. The
+     * store's refcount is bumped by set1, so we drop our reference after. */
+    X509_STORE *store = X509_STORE_new();
+    if (store == NULL) { SSL_free(ssl); return KAI_TLS_ERR_CTX; }
+    if (X509_STORE_load_file(store, ca_file) != 1) {
+      X509_STORE_free(store); SSL_free(ssl); return KAI_TLS_ERR_CERT;
+    }
+    SSL_set1_verify_cert_store(ssl, store);
+    X509_STORE_free(store);
+  }
+
   if (!insecure) {
     SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    if (KAI_TLS_SET_HOST(ssl, host) != 1) { SSL_free(ssl); return KAI_TLS_ERR_SSL; }
+    if (kai_tls_set_verify_name(ssl, host) != 1) { SSL_free(ssl); return KAI_TLS_ERR_SSL; }
     /* Callback MUST stay NULL: OpenSSL's default fails the handshake on a
      * bad chain / hostname / expiry. A callback returning 1 would defeat
      * verification silently — the security of connect() rests on it. */
     SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
   }
-  SSL_set_tlsext_host_name(ssl, host);   /* SNI */
+  /* SNI carries a DNS hostname only (RFC 6066 §3): an IP literal is not a
+   * valid server_name, so skip the extension when connecting by address. */
+  if (!host_is_ip(host)) { SSL_set_tlsext_host_name(ssl, host); }
 
   int rc = wire_slot(idx, ssl);
   if (rc != 0) { return rc; }
   SSL_set_connect_state(slots[idx].ssl);   /* we are the client */
   return (int64_t)idx;
+}
+
+/* Client connection with no client certificate (the common case). */
+int64_t kai_tls_new(const char *host, int64_t insecure) {
+  return client_new(host, (int)insecure, NULL, NULL, NULL);
+}
+
+/* Client presenting a certificate, verifying the server against the system
+ * trust store (mTLS to a server with a publicly-trusted cert). */
+int64_t kai_tls_new_with_cert(const char *host, const char *cert_file,
+                              const char *key_file) {
+  return client_new(host, 0, cert_file, key_file, NULL);
+}
+
+/* Client presenting a certificate AND verifying the server against a
+ * private CA (the full mTLS case: org cert on both ends). */
+int64_t kai_tls_new_with_cert_ca(const char *host, const char *cert_file,
+                                 const char *key_file, const char *ca_file) {
+  return client_new(host, 0, cert_file, key_file, ca_file);
 }
 
 /* Accept a new server-side connection over `listener`'s ctx: a fresh SSL

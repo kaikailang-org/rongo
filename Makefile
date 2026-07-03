@@ -34,23 +34,46 @@ SHIM := ffi/tls_openssl.c
 KAI_CFLAGS := -std=c99 -O2 -Wall $(OPENSSL_CFLAGS) $(SHIM) $(OPENSSL_LIBS)
 
 .PHONY: all demo test example example-post example-concurrent example-keepalive \
-        example-server certs clean check-openssl
+        example-server example-mtls certs clean check-openssl
 
 # The `openssl` CLI from the same install pkg-config resolves.
 OPENSSL_BIN := $(shell $(PKG_ENV) pkg-config --variable=prefix openssl)/bin/openssl
 
 all: build/rongo
 
-# Self-signed dev cert for the TLS server example (CN=localhost, with SAN
-# for localhost + 127.0.0.1). Dev only — never a real key. Gitignored.
-certs: test-certs/server.crt
+# Dev certs for the TLS examples. Dev only — never real keys. Gitignored.
+# One dev CA signs both the server cert (CN=localhost + SAN) and a client
+# cert, so the mTLS example anchors both ends to the same authority. The
+# plain server example (tls_echo) uses connect_insecure and ignores the CA.
+certs: test-certs/ca.crt test-certs/server.crt test-certs/client.crt
 
-test-certs/server.crt:
+# The dev CA that signs the server and client certs.
+test-certs/ca.crt:
 	mkdir -p test-certs
 	$(OPENSSL_BIN) req -x509 -newkey rsa:2048 -nodes \
-	  -keyout test-certs/server.key -out test-certs/server.crt \
-	  -days 3650 -subj "/CN=localhost" \
-	  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+	  -keyout test-certs/ca.key -out test-certs/ca.crt \
+	  -days 3650 -subj "/CN=rongo-test-ca"
+
+# Server cert signed by the dev CA, with a localhost SAN.
+test-certs/server.crt: test-certs/ca.crt
+	$(OPENSSL_BIN) req -newkey rsa:2048 -nodes \
+	  -keyout test-certs/server.key -out test-certs/server.csr \
+	  -subj "/CN=localhost"
+	printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > test-certs/san.ext
+	$(OPENSSL_BIN) x509 -req -in test-certs/server.csr \
+	  -CA test-certs/ca.crt -CAkey test-certs/ca.key -CAcreateserial \
+	  -out test-certs/server.crt -days 3650 -extfile test-certs/san.ext
+	rm -f test-certs/server.csr test-certs/san.ext test-certs/ca.srl
+
+# Client cert signed by the dev CA, for the mTLS example.
+test-certs/client.crt: test-certs/ca.crt
+	$(OPENSSL_BIN) req -newkey rsa:2048 -nodes \
+	  -keyout test-certs/client.key -out test-certs/client.csr \
+	  -subj "/CN=rongo-client"
+	$(OPENSSL_BIN) x509 -req -in test-certs/client.csr \
+	  -CA test-certs/ca.crt -CAkey test-certs/ca.key -CAcreateserial \
+	  -out test-certs/client.crt -days 3650
+	rm -f test-certs/client.csr test-certs/ca.srl
 
 # The entry-point demo (rongo.kai) — a live https.get.
 demo: build/rongo
@@ -99,6 +122,12 @@ build/https_keepalive: examples/https_keepalive/main.kai $(LIB_SRCS) | build
 example-server: build/tls_echo
 build/tls_echo: examples/tls_echo/main.kai $(LIB_SRCS) | build
 	$(call build_example,examples/tls_echo/main.kai,$@)
+
+# The 0.4.0 gate: mutual TLS, both halves rongo's own — a client with a
+# cert is served, a client with none is rejected. Needs `make certs`.
+example-mtls: build/mtls
+build/mtls: examples/mtls/main.kai $(LIB_SRCS) | build
+	$(call build_example,examples/mtls/main.kai,$@)
 
 # Package tests: pure parsers + the effect mock (no network) run under
 # `kai test`; the shim is linked so the FFI externs resolve.
