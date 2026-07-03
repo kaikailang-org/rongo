@@ -348,9 +348,17 @@ connection pooling.
 """)]
 pub type Session = { priv conn: tls.TlsConn, priv host: String, priv port: Int }
 
-#[doc("Open a keep-alive session to `host:port` (default 443 for the URL form).")]
+#[doc("Open a keep-alive session to `host:port`, verifying against the system trust store.")]
 pub fn open_session(host: String, port: Int) : Result[String, Session] / NetTcp + Ffi =
   match tls.connect(host, port) {
+    Err(e) -> Err(e)
+    Ok(c)  -> Ok(Session { conn: c, host: host, port: port })
+  }
+
+#[doc("Open a keep-alive session, trusting a private CA (`ca_path`) for the server cert.")]
+pub fn open_session_ca(host: String, port: Int, ca_path: String)
+    : Result[String, Session] / NetTcp + Ffi =
+  match tls.connect_ca(host, port, ca_path) {
     Err(e) -> Err(e)
     Ok(c)  -> Ok(Session { conn: c, host: host, port: port })
   }

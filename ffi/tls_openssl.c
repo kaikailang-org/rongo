@@ -108,11 +108,12 @@ static SSL_CTX *kai_tls_ctx(void) {
 
 #define KAI_TLS_MAX_LISTENERS 16
 
-/* Listener errors, distinct from connection errors. */
+/* Listener / cert-loading errors, distinct from connection errors. */
 #define KAI_TLS_ERR_LISTENER_FULL (-10)
 #define KAI_TLS_ERR_CTX           (-11)
 #define KAI_TLS_ERR_CERT          (-12)
 #define KAI_TLS_ERR_KEY           (-13)
+#define KAI_TLS_ERR_CA            (-14)
 
 typedef struct {
   SSL_CTX *ctx;
@@ -166,7 +167,7 @@ static int64_t listener_new(const char *cert_file, const char *key_file,
      * 1 would silently admit invalid certs — the rejection depends on
      * this default. */
     if (SSL_CTX_load_verify_file(ctx, ca_file) != 1) {
-      SSL_CTX_free(ctx); return KAI_TLS_ERR_CERT;
+      SSL_CTX_free(ctx); return KAI_TLS_ERR_CA;
     }
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
   }
@@ -298,7 +299,7 @@ static int64_t client_new(const char *host, int insecure,
     X509_STORE *store = X509_STORE_new();
     if (store == NULL) { SSL_free(ssl); return KAI_TLS_ERR_CTX; }
     if (X509_STORE_load_file(store, ca_file) != 1) {
-      X509_STORE_free(store); SSL_free(ssl); return KAI_TLS_ERR_CERT;
+      X509_STORE_free(store); SSL_free(ssl); return KAI_TLS_ERR_CA;
     }
     SSL_set1_verify_cert_store(ssl, store);
     X509_STORE_free(store);
@@ -332,6 +333,12 @@ int64_t kai_tls_new(const char *host, int64_t insecure) {
 int64_t kai_tls_new_with_cert(const char *host, const char *cert_file,
                               const char *key_file) {
   return client_new(host, 0, cert_file, key_file, NULL);
+}
+
+/* Client verifying the server against a private CA, presenting no client
+ * certificate (a server with an org/self-signed cert the caller trusts). */
+int64_t kai_tls_new_ca(const char *host, const char *ca_file) {
+  return client_new(host, 0, NULL, NULL, ca_file);
 }
 
 /* Client presenting a certificate AND verifying the server against a

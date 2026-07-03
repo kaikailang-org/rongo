@@ -1,0 +1,36 @@
+# Pure request-framing checks for the HTTP server — no network, no FFI.
+# These exercise the request completeness / chunked detection that decides
+# when the server has a full request and whether to refuse it.
+
+import rongo.http_server
+
+test "a GET with no body is complete at the blank line" {
+  assert http_server.request_complete("GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
+}
+
+test "a request without its full body is incomplete" {
+  # Content-Length: 5 but only 2 body bytes present.
+  assert not http_server.request_complete("POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhi")
+}
+
+test "a request with its full body is complete" {
+  assert http_server.request_complete("POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello")
+}
+
+test "no blank line yet means incomplete" {
+  assert not http_server.request_complete("GET /x HTTP/1.1\r\nHost: h")
+}
+
+test "chunked request is detected" {
+  assert http_server.is_chunked("POST /x HTTP/1.1\r\nTransfer-Encoding: chunked")
+}
+
+test "chunked detection is case-insensitive" {
+  assert http_server.is_chunked("POST /x HTTP/1.1\r\ntransfer-encoding: CHUNKED")
+}
+
+test "a plain request is not chunked" {
+  assert not http_server.is_chunked("POST /x HTTP/1.1\r\nContent-Length: 3")
+}
+
+fn main() : Int = 0
