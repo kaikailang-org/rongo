@@ -3,6 +3,12 @@
 A priority-ordered list, not a version-locked plan. What comes next,
 most-wanted first.
 
+rongo delivers the **elements** for advanced networking — the TLS layer that
+carries OpenSSL, client/server HTTP primitives, protocols over TLS. It is not
+an HTTP framework: routing, middleware, and the app model are built *on top of*
+rongo (they consume `serve` and the request/response pieces). Every item here
+is a reusable element, not a framework opinion.
+
 ## Shipped
 
 - **0.1.0** — the TLS client lane: `https://` over OpenSSL with mandatory
@@ -64,11 +70,17 @@ guard would contain them with a minimal change. Until then, handlers must
 not trap — this is the Erlang-style fault isolation kaikai does not yet
 give a server.
 
-## 2. Request routing + body limits
+## 2. Separate header/body size limits
 
-0.5.0's server hands the whole `Request` to one handler. A router
-(method + path patterns → handlers), separate header/body size limits, and
-finer error responses (413, 400) are the next layer on top of `serve`.
+0.5.0 caps a whole request with one `max_request_bytes`. Separate
+`max_header_bytes` / `max_body_bytes` limits, with the matching status
+responses (413 Payload Too Large, 400 Bad Request), let a server reject an
+oversized header block before buffering a body — a framing-level defense,
+independent of any routing a framework layers on top.
+
+Routing, middleware, and the app model live in the HTTP framework built on
+rongo, not here — rongo delivers `serve` and the request/response pieces; the
+framework orchestrates them.
 
 ## 3. HTTP server keep-alive drain + connection pooling (client)
 
