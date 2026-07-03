@@ -1,3 +1,9 @@
+## v0.5.0 (2026-07-03)
+
+### Feat
+
+- **http**: add the HTTP server framework — serve(listener, handler)
+
 ## v0.4.0 (2026-07-02)
 
 ### Feat
