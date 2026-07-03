@@ -27,7 +27,7 @@ fn contains(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Bool =
   else if string_slice(hay, i, nn) == needle { true }
   else { contains(hay, needle, i + 1, hn, nn) }
 
-fn main() : Unit / Console + Ffi = {
+fn main() : Unit / Console + NetTcp + Ffi = {
   let body = big_body(2000, "")
   print("POST https://postman-echo.com/post  (#{int_to_string(string_length(body))} bytes)")
   let resp = https.post("https://postman-echo.com/post", body)

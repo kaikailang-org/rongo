@@ -34,9 +34,22 @@ jobs:
           ./build/https_get | tee /tmp/get.out
           grep -q "status: 200" /tmp/get.out
 
-      - name: Live POST — send_all partial-write path (>16 KB body)
+      - name: Live POST — the send path over a >16 KB body
         run: |
           make example-post
           ./build/https_post | tee /tmp/post.out
           grep -q "status: 200" /tmp/post.out
           grep -q "body echoed intact: yes" /tmp/post.out
+
+      - name: Concurrent requests — one must not block the other
+        run: |
+          make example-concurrent
+          ./build/https_concurrent | tee /tmp/conc.out
+          grep -q "neither blocked the other" /tmp/conc.out
+
+      - name: Keep-alive — many requests over one connection
+        timeout-minutes: 1
+        run: |
+          make example-keepalive
+          ./build/https_keepalive | tee /tmp/ka.out
+          grep -q "1 connection, 1 handshake" /tmp/ka.out

@@ -1,0 +1,35 @@
+#[doc("""
+Three requests over ONE persistent connection — 0.2.0's keep-alive.
+
+`open_session` opens the TLS connection once (one TCP connect, one TLS
+handshake); each `session_get` reuses it. The response is framed by
+Content-Length / chunked, so the server keeps the connection open between
+requests instead of closing it. `close_session` ends it at the end.
+
+Contrast with `https.get`, which opens and closes a fresh connection —
+and a fresh handshake — every call.
+
+Build & run (from the repo root):
+  make example-keepalive && ./build/https_keepalive
+""")]
+
+import rongo.https
+import net.http
+
+fn main() : Unit / Console + NetTcp + Ffi = {
+  match https.open_session("postman-echo.com", 443) {
+    Err(e) -> print("session failed: #{e}")
+    Ok(s)  -> {
+      # Three GETs over the same connection — no re-handshake between them.
+      let paths = ["https://postman-echo.com/get?n=1",
+                   "https://postman-echo.com/get?n=2",
+                   "https://postman-echo.com/get?n=3"]
+      paths | (url => {
+        let resp = https.session_get(s, url)
+        print("#{url} -> #{int_to_string(resp.status)} (#{int_to_string(string_length(resp.body))} bytes)")
+      })
+      https.close_session(s)
+      print("3 requests, 1 connection, 1 handshake")
+    }
+  }
+}

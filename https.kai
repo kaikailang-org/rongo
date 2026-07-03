@@ -15,6 +15,7 @@ bodies. No keep-alive, no compression, no cookies.
 """)]
 
 import net.http
+import net.tcp
 import rongo.ffi.tls
 
 # ---- HTTPS URL parsing --------------------------------------------
@@ -92,78 +93,294 @@ fn serialize(u: http.HttpUrl, req: http.Request) : String = {
   let line1 = string_concat_all([req.method, " ", path, " HTTP/1.1\r\n"])
   let host  = string_concat_all(["Host: ", host_header(u), "\r\n"])
   let clen  = string_concat_all(["Content-Length: ", int_to_string(string_length(req.body)), "\r\n"])
-  # Connection: close so the peer ends the stream and our drain loop
-  # terminates — this v1 opens a fresh connection per request.
-  let conn  = "Connection: close\r\n"
+  # No `Connection: close`: HTTP/1.1 defaults to keep-alive, and the read
+  # loop frames the response by Content-Length / chunked, so it does not
+  # depend on the peer closing. A caller wanting a one-shot close adds the
+  # header to `req.headers`.
   let extra = format_headers(req.headers)
-  string_concat_all([line1, host, clen, conn, extra, "\r\n", req.body])
+  string_concat_all([line1, host, clen, extra, "\r\n", req.body])
 }
 
 # ---- transport over Tls -------------------------------------------
+#
+# recv_response reads until it holds ONE complete HTTP/1.1 response, framed
+# by Content-Length or chunked transfer — NOT by the peer closing. This is
+# what makes keep-alive work: on a persistent connection the server never
+# closes, so a drain-to-EOF loop would hang. The framing precedence mirrors
+# net.http.parse_response.
 
-# Drain the connection in 4096-byte reads until the peer closes
-# (recv returns Ok([])). Reverse-prepend each chunk, reverse once at end.
-fn recv_all(c: tls.TlsConn, acc: [Int]) : Result[String, [Int]] / Ffi =
-  match tls.recv(c, 4096) {
+# `method` is the request verb: a HEAD response never carries a body
+# regardless of its headers, so it completes at the blank line.
+fn recv_response(c: tls.TlsConn, method: String) : Result[String, String] / NetTcp + Ffi =
+  recv_response_loop(c, method, [])
+
+fn recv_response_loop(c: tls.TlsConn, method: String, acc_rev: [Int])
+    : Result[String, String] / NetTcp + Ffi = {
+  let raw = http.bytes_to_string(list_reverse(acc_rev))
+  if response_complete(raw, method) { Ok(raw) }
+  else { match tls.recv(c, 4096) {
     Err(e)    -> Err(e)
     Ok(chunk) -> match chunk {
-      [] -> Ok(list_reverse(acc))
-      _  -> recv_all(c, prepend(chunk, acc))
+      # Peer closed: take what parsed as complete, else report truncation.
+      [] -> if response_complete(raw, method) { Ok(raw) }
+            else if string_length(raw) > 0 { Ok(raw) }   # body-to-EOF (no framing) ended by close
+            else { Err("https: peer closed before any response") }
+      _  -> recv_response_loop(c, method, prepend(chunk, acc_rev))
     }
-  }
+  } }
+}
 
 fn prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
   []           -> acc
   [b, ...rest] -> prepend(rest, [b, ...acc])
 }
 
-#[doc("""
-Issue `req` over TLS and return the parsed `Response`. `req.url` must be
-an absolute `https://` URL. Any failure — URL, connect, verify, send,
-recv, parse — collapses to a synthetic `Response` with status 0 and the
-error in `body`, matching net.http.request's contract so callers see the
-failure without a Result on every call.
-""")]
-pub fn request(req: http.Request) : http.Response / Ffi = {
-  match parse_url(req.url) {
-    Err(e) -> http.Response { status: 0, headers: [], body: e }
-    Ok(u)  -> match tls.connect(u.host, u.port) {
-      Err(e) -> http.Response { status: 0, headers: [], body: string_concat("connect: ", e) }
-      Ok(c)  -> {
-        let wire = serialize(u, req)
-        # send_all, not send: a short write would leave the server waiting
-        # for the rest of the request (its Content-Length is unmet).
-        match tls.send_all(c, http.string_to_bytes(wire)) {
-          Err(e) -> { tls.close(c); http.Response { status: 0, headers: [], body: string_concat("send: ", e) } }
-          Ok(_)  -> match recv_all(c, []) {
-            Err(e) -> { tls.close(c); http.Response { status: 0, headers: [], body: string_concat("recv: ", e) } }
-            Ok(bs) -> {
-              tls.close(c)
-              let raw = http.bytes_to_string(bs)
-              match http.parse_response(raw) {
-                Ok(r)  -> r
-                Err(e) -> http.Response { status: 0, headers: [], body: e }
-              }
-            }
-          }
+# Does `raw` hold a complete HTTP/1.1 response for a `method` request?
+# Body framing per RFC 9110 §6.4.1:
+#   - HEAD response, or status 1xx / 204 / 304: NO body ever — complete
+#     at the blank line, regardless of Content-Length.
+#   - Transfer-Encoding: chunked: complete when the 0-size chunk is parsed.
+#   - Content-Length: N: complete when N body bytes have arrived.
+#   - none of the above: the body runs to connection close (no keep-alive
+#     framing) — never "complete" until the peer closes (handled by the
+#     recv loop's EOF branch).
+fn response_complete(raw: String, method: String) : Bool = {
+  let sep = "\r\n\r\n"
+  let i   = find(raw, sep)
+  if i < 0 { false }
+  else {
+    let head       = string_slice(raw, 0, i)
+    let body_start = i + string_length(sep)
+    let body_len   = string_length(raw) - body_start
+    let status     = status_of(head)
+    if bodyless(method, status) { true }
+    else {
+      let hdrs = parse_headers(head)
+      match header_ci(hdrs, "transfer-encoding") {
+        Some(te) -> if contains_ci(te, "chunked") { chunked_complete(raw, body_start) }
+                    else { false }
+        None -> match header_ci(hdrs, "content-length") {
+          Some(v) -> match string_to_int(trim(v)) { Some(n) -> body_len >= n  None -> false }
+          None    -> false          # body-to-close: only the EOF branch completes it
         }
       }
     }
   }
 }
 
+# A response with no body by spec: HEAD request, or an informational /
+# no-content / not-modified status.
+fn bodyless(method: String, status: Int) : Bool =
+  method == "HEAD" or (status >= 100 and status < 200) or status == 204 or status == 304
+
+# Parse the status code out of the status line (`HTTP/1.1 <code> ...`).
+fn status_of(head: String) : Int = {
+  let line = match string_split(head, "\r\n") {
+    [l, ..._] -> l
+    []        -> ""
+  }
+  match string_split(line, " ") {
+    [_proto, code, ..._] -> match string_to_int(code) { Some(n) -> n  None -> 0 }
+    _ -> 0
+  }
+}
+
+# Walk the chunked body frame by frame (<hex-size>\r\n<data>\r\n …) and
+# report true only once the terminating 0-size chunk AND the final CRLF
+# have arrived. A plain substring search for "0\r\n\r\n" would
+# false-positive on binary bodies. The terminating chunk may carry a
+# chunk-ext (`0;name=value`) and an optional trailer block, both ending
+# at the blank line, so we require the closing `\r\n\r\n` measured from
+# the terminator's size line — otherwise trailers left unconsumed would
+# corrupt the next request on a keep-alive connection.
+fn chunked_complete(raw: String, pos: Int) : Bool = {
+  let crlf = find_from(raw, "\r\n", pos)
+  if crlf < 0 { false }                          # size line not fully arrived
+  else {
+    let size_str = string_slice(raw, pos, crlf - pos)
+    match parse_hex(trim(size_str)) {
+      None    -> false
+      # Terminator: the message ends at the blank line after it (with or
+      # without a trailer block). Require that blank line to have arrived.
+      Some(0) -> find_from(raw, "\r\n\r\n", pos) >= 0
+      Some(n) -> {
+        # Skip this chunk's data + its trailing CRLF, then continue.
+        let data_start = crlf + 2
+        let next = data_start + n + 2
+        if next > string_length(raw) { false }    # chunk not fully arrived
+        else { chunked_complete(raw, next) }
+      }
+    }
+  }
+}
+
+fn find_from(hay: String, needle: String, from: Int) : Int = {
+  let hn = string_length(hay)
+  let nn = string_length(needle)
+  find_from_loop(hay, needle, from, hn, nn)
+}
+fn find_from_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int =
+  if i + nn > hn { 0 - 1 }
+  else if string_slice(hay, i, nn) == needle { i }
+  else { find_from_loop(hay, needle, i + 1, hn, nn) }
+
+fn parse_hex(s: String) : Option[Int] = {
+  let n = string_length(s)
+  if n == 0 { None } else { parse_hex_loop(s, 0, n, 0) }
+}
+fn parse_hex_loop(s: String, i: Int, n: Int, acc: Int) : Option[Int] =
+  if i >= n { Some(acc) }
+  else { match char_at(s, i) {
+    None -> Some(acc)
+    Some(c) -> match hex_digit(c) { None -> Some(acc)  Some(v) -> parse_hex_loop(s, i + 1, n, acc * 16 + v) }
+  } }
+fn hex_digit(c: Char) : Option[Int] =
+  if c >= '0' and c <= '9' { Some(char_to_int(c) - char_to_int('0')) }
+  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
+  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
+  else { None }
+
+# Minimal case-insensitive header parse over the header block (skip the
+# status line). Returns [(name-lower, value)].
+fn parse_headers(head: String) : [http.HttpHeader] = {
+  let lines = string_split(head, "\r\n")
+  match lines {
+    []           -> []
+    [_, ...rest] -> parse_header_lines(rest, [])
+  }
+}
+
+fn parse_header_lines(lines: [String], acc: [http.HttpHeader]) : [http.HttpHeader] = match lines {
+  [] -> list_reverse(acc)
+  [l, ...rest] -> {
+    let i = find(l, ":")
+    if i < 0 { parse_header_lines(rest, acc) }
+    else {
+      let nm = lower(string_slice(l, 0, i))
+      let vl = trim(string_slice(l, i + 1, string_length(l) - i - 1))
+      parse_header_lines(rest, [http.HttpHeader { name: nm, value: vl }, ...acc])
+    }
+  }
+}
+
+fn header_ci(hs: [http.HttpHeader], name_lower: String) : Option[String] = match hs {
+  [] -> None
+  [h, ...rest] -> if h.name == name_lower { Some(h.value) } else { header_ci(rest, name_lower) }
+}
+
+fn lower(s: String) : String = string_concat_all(list.map(char_list(s), lower_char))
+fn lower_char(c: Char) : String = if c >= 'A' and c <= 'Z' { "#{int_to_char(char_to_int(c) + 32)}" } else { "#{c}" }
+fn char_list(s: String) : [Char] = char_list_loop(s, 0, string_length(s), [])
+fn char_list_loop(s: String, i: Int, n: Int, acc: [Char]) : [Char] =
+  if i >= n { list_reverse(acc) }
+  else { match char_at(s, i) { Some(c) -> char_list_loop(s, i + 1, n, [c, ...acc])  None -> list_reverse(acc) } }
+
+fn contains_ci(hay: String, needle_lower: String) : Bool =
+  find(lower(hay), needle_lower) >= 0
+
+fn trim(s: String) : String = {
+  let n = string_length(s)
+  let lo = ltrim(s, 0, n)
+  let hi = rtrim(s, n)
+  if hi <= lo { "" } else { string_slice(s, lo, hi - lo) }
+}
+fn is_ws(c: Char) : Bool = c == ' ' or c == '\t' or c == '\r' or c == '\n'
+fn ltrim(s: String, i: Int, n: Int) : Int =
+  if i >= n { i } else { match char_at(s, i) { Some(c) -> if is_ws(c) { ltrim(s, i + 1, n) } else { i }  None -> i } }
+fn rtrim(s: String, i: Int) : Int =
+  if i <= 0 { 0 } else { match char_at(s, i - 1) { Some(c) -> if is_ws(c) { rtrim(s, i - 1) } else { i }  None -> i } }
+
+# Run one request/response exchange over an already-open connection `c`
+# for URL `u`. Does NOT open or close `c` — that is the caller's (so a
+# session can reuse it). Returns the parsed Response, or a status-0
+# Response carrying the error.
+fn exchange(c: tls.TlsConn, u: http.HttpUrl, req: http.Request)
+    : http.Response / NetTcp + Ffi = {
+  let wire = serialize(u, req)
+  match tls.send(c, http.string_to_bytes(wire)) {
+    Err(e) -> http.Response { status: 0, headers: [], body: string_concat("send: ", e) }
+    Ok(_)  -> match recv_response(c, req.method) {
+      Err(e) -> http.Response { status: 0, headers: [], body: string_concat("recv: ", e) }
+      Ok(raw) -> match http.parse_response(raw) {
+        Ok(r)  -> r
+        Err(e) -> http.Response { status: 0, headers: [], body: e }
+      }
+    }
+  }
+}
+
+#[doc("""
+Issue `req` over a fresh TLS connection and return the parsed `Response`.
+`req.url` must be an absolute `https://` URL. Opens, exchanges, closes —
+one request per connection. For several requests to one host, use
+`open_session`. Any failure collapses to a status-0 `Response` with the
+error in `body`, matching net.http.request's contract.
+""")]
+pub fn request(req: http.Request) : http.Response / NetTcp + Ffi = {
+  match parse_url(req.url) {
+    Err(e) -> http.Response { status: 0, headers: [], body: e }
+    Ok(u)  -> match tls.connect(u.host, u.port) {
+      Err(e) -> http.Response { status: 0, headers: [], body: string_concat("connect: ", e) }
+      Ok(c)  -> {
+        let resp = exchange(c, u, req)
+        tls.close(c)
+        resp
+      }
+    }
+  }
+}
+
+# ---- keep-alive session -------------------------------------------
+
+#[doc("""
+A persistent HTTPS connection to one host:port. Open it once with
+`open_session`, issue several requests over it with `session_get` /
+`session_request` (reusing the TCP connection AND the TLS session — no
+re-handshake), then `close_session`. The response framing is by
+Content-Length / chunked, so the server keeps the connection open between
+requests. All request paths must target the session's host:port.
+
+A request whose `status` is 0 signals a transport failure (send/recv
+error): after one, the connection may be in an indeterminate state, so
+`close_session` it and `open_session` a fresh one rather than reusing it.
+There is no automatic dead-connection detection yet — that lands with
+connection pooling.
+""")]
+pub type Session = { priv conn: tls.TlsConn, priv host: String, priv port: Int }
+
+#[doc("Open a keep-alive session to `host:port` (default 443 for the URL form).")]
+pub fn open_session(host: String, port: Int) : Result[String, Session] / NetTcp + Ffi =
+  match tls.connect(host, port) {
+    Err(e) -> Err(e)
+    Ok(c)  -> Ok(Session { conn: c, host: host, port: port })
+  }
+
+#[doc("Issue `req` over the session's persistent connection. `req.url`'s path is used; its host must match the session.")]
+pub fn session_request(s: Session, req: http.Request) : http.Response / NetTcp + Ffi =
+  match parse_url(req.url) {
+    Err(e) -> http.Response { status: 0, headers: [], body: e }
+    Ok(u)  -> exchange(s.conn, u, req)
+  }
+
+#[doc("GET `url` over the session's persistent connection.")]
+pub fn session_get(s: Session, url: String) : http.Response / NetTcp + Ffi =
+  session_request(s, http.Request { method: "GET", url: url, headers: [], body: "" })
+
+#[doc("Close a keep-alive session (TLS shutdown + transport close).")]
+pub fn close_session(s: Session) : Unit / NetTcp + Ffi = tls.close(s.conn)
+
 #[doc("Issues an HTTPS GET to `url` with no extra headers and returns the response.")]
-pub fn get(url: String) : http.Response / Ffi =
+pub fn get(url: String) : http.Response / NetTcp + Ffi =
   request(http.Request { method: "GET", url: url, headers: [], body: "" })
 
 #[doc("Issues an HTTPS POST to `url` carrying `body`, with no extra headers.")]
-pub fn post(url: String, body: String) : http.Response / Ffi =
+pub fn post(url: String, body: String) : http.Response / NetTcp + Ffi =
   request(http.Request { method: "POST", url: url, headers: [], body: body })
 
 #[doc("Issues an HTTPS PUT to `url` carrying `body`, with no extra headers.")]
-pub fn put(url: String, body: String) : http.Response / Ffi =
+pub fn put(url: String, body: String) : http.Response / NetTcp + Ffi =
   request(http.Request { method: "PUT", url: url, headers: [], body: body })
 
 #[doc("Issues an HTTPS DELETE to `url` with no extra headers.")]
-pub fn delete(url: String) : http.Response / Ffi =
+pub fn delete(url: String) : http.Response / NetTcp + Ffi =
   request(http.Request { method: "DELETE", url: url, headers: [], body: "" })
