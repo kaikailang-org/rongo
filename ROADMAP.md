@@ -4,32 +4,53 @@ A priority-ordered list, not a version-locked plan. `0.1.0` ships the
 TLS client lane: `https://` over OpenSSL with mandatory certificate
 verification. What comes next, most-wanted first.
 
-## 1. Connection reuse — keep-alive + pooling
+## 0.2.0 — TLS over NetTcp: non-blocking I/O + keep-alive
 
-Today every request is connect → send → drain → close: one TLS handshake
-per request, the dominant cost of an HTTPS call. Add HTTP/1.1 keep-alive
-(honour `Connection: keep-alive`, reuse the `TlsConn` across requests to
-the same host:port) and a connection pool over the slot table.
-
-Prerequisite work this unblocks a fix for: the slot table is a fixed 128
-entries with no RAII — a leaked handle is never reclaimed. Pooling needs
-real lifecycle management (idle eviction, max-per-host), which is the
-natural place to add reclamation.
-
-## 2. Reactor-aware, non-blocking TLS I/O
-
-The shim's socket is plain-blocking and invisible to kaikai's reactor, so
+The one big rearchitecture, and the thing that unblocks everything after
+it. Today the shim owns its own blocking socket (`SSL_set_fd`), so
 `SSL_read`/`SSL_write` block the whole OS thread — one in-flight TLS
-request stalls every other fiber. kaikai's reactor already drives its own
-`NetTcp` fds non-blocking (Phase R2); rongo should do the same: open the
-fd `O_NONBLOCK`, drive the handshake and I/O off `SSL_ERROR_WANT_READ`/
-`WANT_WRITE`, and park the fiber on readiness instead of the thread.
+request stalls every other fiber. kaikai HAS a reactor that drives its
+own `NetTcp` fds non-blocking (Phase R2), but its API is `static` to the
+runtime: a user FFI shim cannot register its own fd. So "just set the fd
+O_NONBLOCK" is not open to us.
 
-This retires two documented invariants at once — the `recv` static buffer
-and the `insecure_mode` global both become unsafe the moment I/O yields
-mid-call, so both must move to per-connection state as part of this work.
-A `Cancel` raised mid-request also becomes able to actually interrupt,
-which the blocking path cannot do.
+The fix is the architecture Rustls, Go `crypto/tls`, and Erlang `ssl`
+all use: **separate the TLS state machine from the transport.** OpenSSL
+runs over memory BIOs (`BIO_s_mem`) — it only encrypts/decrypts into
+buffers and never touches a socket. kaikai's `NetTcp` (already
+reactor-aware) moves the ciphertext bytes. The mem-BIO is the dumb joint
+between them: OpenSSL doesn't know NetTcp is below, NetTcp doesn't know
+TLS is above.
+
+This lands both wanted features at once:
+- **Non-blocking I/O** comes free — the fiber-yielding is NetTcp's, so a
+  TLS request in flight no longer stalls other fibers. `Cancel` can
+  actually interrupt.
+- **Keep-alive** falls out naturally — the reusable connection IS a
+  NetTcp `Conn`, kept open across requests, paired with a persistent SSL
+  slot (the TLS session survives, no re-handshake).
+
+Design decisions (from architecture review):
+- **One pump in C, parameterised by op** (handshake/read/write/shutdown),
+  not four pumps. The single real trap: drain the write-BIO after EVERY
+  SSL op unconditionally (OpenSSL emits outgoing bytes even on WANT_READ),
+  not just on WANT_WRITE. Nail it once.
+- **The pump lives in C; the kaikai driver only shuttles ciphertext.**
+  The shim exposes a state machine ("give me ciphertext" / "take this
+  ciphertext to send"); the driver never sees a TLS record or a
+  WANT_READ. Keeps the `SSL_get_error` switch off the FFI boundary.
+- **`TlsConn = { conn: NetTcp.Conn, slot: Int }`, single kaikai owner,
+  atomic ordered close**: SSL_shutdown → drain close_notify → NetTcp.close
+  → free slot. A recv-EOF between requests marks the pair dead so the
+  pool won't reuse it.
+- The shim shrinks: it drops DNS/connect/socket (NetTcp owns those) and
+  becomes just the crypto engine (SSL + mem-BIOs + the pump).
+- Retires two 0.1.0 invariants (recv static buffer, insecure_mode global)
+  — both move to per-connection state, since I/O now yields mid-call.
+
+Gate: `https_get` completes the handshake and returns a body
+byte-identical to the 0.1.0 blocking lane, plus a second concurrent
+request proving one no longer stalls the other.
 
 ## 3. TLS server side + mutual TLS
 
