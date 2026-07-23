@@ -7,20 +7,29 @@ import rongo.tls.{Tls}
 
 # A mock handler: write is a no-op success, read returns canned "hi",
 # close does nothing. No handle to mint — the effect has none.
-fn with_mock[a](body: () -> a / Tls) : a =
-  handle { body() } with Tls {
-    write(data, resume) -> resume(Ok(()))
-    read(max, resume)   -> resume(Ok([104, 105]))   # "hi"
-    close(resume)       -> resume(())
-  }
+fn with_mock[a](body: () -> a / Tls) : a = handle {
+  body()
+} with Tls {
+  write(data, resume) -> resume(Ok(()))
+  read(max, resume) -> resume(Ok([104, 105]))
+  close(resume) -> 
+  # "hi"
+  resume(())
+}
 
 # A client that writes then reads over the Tls effect. Under the mock it
 # never touches the network.
-fn roundtrip() : Int / Tls = {
-  let wrote = match Tls.write([71, 69, 84]) { Ok(_) -> 1  Err(_) -> 0 }
-  let got   = match Tls.read(4096) { Ok(bs) -> list_length(bs)  Err(_) -> 0 }
+fn roundtrip() : Int / Tls {
+  let wrote = match Tls.write([71, 69, 84]) {
+    Ok(_) -> 1
+    Err(_) -> 0
+  }
+  let got = match Tls.read(4096) {
+    Ok(bs) -> list_length(bs)
+    Err(_) -> 0
+  }
   Tls.close()
-  wrote * 100 + got
+  (wrote * 100) + got
 }
 
 test "Tls effect drives through a mock handler" {
@@ -29,14 +38,20 @@ test "Tls effect drives through a mock handler" {
 }
 
 test "a mock read can report an error" {
-  let r = handle { Tls.read(16) } with Tls {
+  let r = handle {
+    Tls.read(16)
+  } with Tls {
     write(data, resume) -> resume(Ok(()))
-    read(max, resume)   -> resume(Err("mock: connection reset"))
-    close(resume)       -> resume(())
+    read(max, resume) -> resume(Err("mock: connection reset"))
+    close(resume) -> resume(())
   }
   match r {
-    Ok(_)  -> { assert false }
-    Err(e) -> { assert e == "mock: connection reset" }
+    Ok(_) -> {
+      assert false
+    }
+    Err(e) -> {
+      assert e == "mock: connection reset"
+    }
   }
 }
 

@@ -19,53 +19,62 @@ Build & run (from the repo root):
 """)]
 
 import rongo.http_server
+
 import rongo.https
+
 import rongo.ffi.tls
+
 import net.http
+
 import spawn
 
 const PORT : Int = 8446
 
 # The request handler: log, echo the path — and crash on /crash to exercise
 # the per-request crash isolation (`serve` catches the raise → 500).
-fn handler(req: http.Request) : http.Response / Console + Cancel = {
+fn handler(req: http.Request) : http.Response / Console + Cancel {
   print("server: #{req.method} #{req.url}")
-  if req.url == "/crash" { Cancel.raise() }
-  else { http.Response { status: 200, headers: [], body: "you asked for #{req.url}" } }
+  if req.url == "/crash" {
+    Cancel.raise()
+  } else {
+    http.Response { status: 200, headers: [], body: "you asked for #{req.url}" }
+  }
 }
 
-fn get_status(s: https.Session, path: String) : Int / NetTcp + Ffi =
-  https.session_get(s, "https://localhost:#{int_to_string(PORT)}#{path}").status
+fn get_status(s: https.Session, path: String) : Int / NetTcp + Ffi = https.session_get(s, "https://localhost:#{int_to_string(PORT)}#{path}").status
 
 # Client: three requests over one keep-alive session (one of which crashes
 # the handler), then one more over a FRESH session to prove the server is
 # still up after the crash.
-fn run_client() : (Int, Int, Int) / NetTcp + Ffi =
-  match https.open_session_ca("localhost", PORT, "test-certs/ca.crt") {
-    Err(_) -> (0, 0, 0)
-    Ok(s)  -> {
-      let ok    = get_status(s, "/first")     # normal → 200
-      let boom  = get_status(s, "/crash")     # handler raises → server answers 500
-      https.close_session(s)
-      # Fresh connection after the crash: the server must still be serving.
-      let after = match https.open_session_ca("localhost", PORT, "test-certs/ca.crt") {
-        Err(_) -> 0
-        Ok(s2) -> { let r = get_status(s2, "/second"); https.close_session(s2); r }
+fn run_client() : Triple[Int, Int, Int] / NetTcp + Ffi = match https.open_session_ca("localhost", PORT, "test-certs/ca.crt") {
+  Err(_) -> Triple { fst: 0, snd: 0, trd: 0 }
+  Ok(s) -> {
+    let ok = get_status(s, "/first")  # normal → 200
+    let boom = get_status(s, "/crash")  # handler raises → server answers 500
+    https.close_session(s)
+    # Fresh connection after the crash: the server must still be serving.
+    let after = match https.open_session_ca("localhost", PORT, "test-certs/ca.crt") {
+      Err(_) -> 0
+      Ok(s2) -> {
+        let r = get_status(s2, "/second")
+        https.close_session(s2)
+        r
       }
-      (ok, boom, after)
     }
+    Triple { fst: ok, snd: boom, trd: after }
   }
+}
 
-fn main() : Unit / Console + NetTcp + Ffi + Spawn = {
+fn main() : Unit / Console + NetTcp + Ffi + Spawn {
   match tls.listen("127.0.0.1", PORT, "test-certs/server.crt", "test-certs/server.key") {
     Err(e) -> print("listen: #{e}")
-    Ok(l)  -> {
-      let (ok, boom, after) = nursery { n ->
+    Ok(l) -> {
+      let Triple { fst: ok, snd: boom, trd: after } = nursery(n => {
         let srv = n.spawn(() => http_server.serve(l, handler))
         let res = n.await(n.spawn(() => run_client()))
-        n.cancel(srv)                          # stop the server; nursery unwinds
+        n.cancel(srv)  # stop the server; nursery unwinds
         res
-      }
+      })
       print("normal request:       #{int_to_string(ok)} (expect 200)")
       print("crashing request:     #{int_to_string(boom)} (expect 500)")
       print("request after crash:  #{int_to_string(after)} (expect 200 — server survived)")

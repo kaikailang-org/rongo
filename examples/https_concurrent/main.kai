@@ -13,22 +13,27 @@ Build & run (from the repo root):
 """)]
 
 import rongo.https
+
 import net.http
+
 import spawn
 
 # Fetch a URL and return a one-line summary. Runs on its own fiber.
-fn fetch(url: String) : String / NetTcp + Ffi = {
+fn fetch(url: String) : String / NetTcp + Ffi {
   let resp = https.get(url)
-  if resp.status == 0 { "#{url} -> failed: #{resp.body}" }
-  else { "#{url} -> #{int_to_string(resp.status)}, #{int_to_string(string_length(resp.body))} bytes" }
+  if resp.status == 0 {
+    "#{url} -> failed: #{resp.body}"
+  } else {
+    "#{url} -> #{int_to_string(resp.status)}, #{int_to_string(string_length(resp.body))} bytes"
+  }
 }
 
-fn main() : Unit / Console + NetTcp + Ffi + Spawn = {
+fn main() : Unit / Console + NetTcp + Ffi + Spawn {
   let urls = ["https://example.com/", "https://postman-echo.com/get"]
-  let results = nursery { n ->
+  let results = nursery(n => {
     let fibers = urls | (u => n.spawn(() => fetch(u)))
     fibers | (f => n.await(f))
-  }
+  })
   results | (line => print(line))
   print("both done — neither blocked the other")
 }

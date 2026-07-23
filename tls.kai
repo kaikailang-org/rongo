@@ -23,6 +23,7 @@ multiplexing N connections under one handler is out of scope here.
 """)]
 
 import rongo.ffi.tls
+
 import net.tcp
 
 #[doc("""
@@ -32,8 +33,8 @@ itself is the handler, not a parameter. `write` sends all of `data`;
 `close` ends the session.
 """)]
 pub effect Tls {
-  write(data: [Int]) : Result[String, Unit]
-  read(max: Int) : Result[String, [Int]]
+  write(data: [Int]) : Result[Unit, String]
+  read(max: Int) : Result[[Int], String]
   close() : Unit
 }
 
@@ -49,17 +50,17 @@ otherwise the body's value.
 Carries `/ NetTcp + Ffi` because the engine runs TLS over NetTcp through
 the FFI shim. A test that installs its own handler needs neither.
 """)]
-pub fn tls_wrap[a](host: String, port: Int, body: () -> a / Tls)
-    : Result[String, a] / NetTcp + Ffi =
-  match tls.connect(host, port) {
-    Err(e) -> Err(e)
-    Ok(c)  -> {
-      let result = handle { body() } with Tls {
-        write(data, resume) -> resume(tls.send(c, data))
-        read(max, resume)   -> resume(tls.recv(c, max))
-        close(resume)       -> resume(())
-      }
-      tls.close(c)
-      Ok(result)
+pub fn tls_wrap[a](host: String, port: Int, body: () -> a / Tls) : Result[a, String] / NetTcp + Ffi = match tls.connect(host, port) {
+  Err(e) -> Err(e)
+  Ok(c) -> {
+    let result = handle {
+      body()
+    } with Tls {
+      write(data, resume) -> resume(tls.send(c, data))
+      read(max, resume) -> resume(tls.recv(c, max))
+      close(resume) -> resume(())
     }
+    tls.close(c)
+    Ok(result)
   }
+}

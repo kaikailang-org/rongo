@@ -17,9 +17,10 @@ This entry point is a thin demo. See `examples/` for real usage.
 """)]
 
 import rongo.https
+
 import net.http
 
-fn main() : Unit / Console + NetTcp + Ffi = {
+fn main() : Unit / Console + NetTcp + Ffi {
   let resp = https.get("https://example.com/")
   if resp.status == 0 {
     print("request failed: #{resp.body}")

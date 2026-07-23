@@ -11,15 +11,15 @@ Or directly:
 """)]
 
 import rongo.https
+
 import net.http
 
-fn show_header(name: String, resp: http.Response) : Unit / Console =
-  match http.header_lookup(resp.headers, name) {
-    Some(v) -> print("  #{name}: #{v}")
-    None    -> ()
-  }
+fn show_header(name: String, resp: http.Response) : Unit / Console = match http.header_lookup(resp.headers, name) {
+  Some(v) -> print("  #{name}: #{v}")
+  None -> ()
+}
 
-fn main() : Unit / Console + NetTcp + Ffi = {
+fn main() : Unit / Console + NetTcp + Ffi {
   let url = "https://example.com/"
   print("GET #{url}")
   let resp = https.get(url)
