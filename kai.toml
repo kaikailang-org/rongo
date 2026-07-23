@@ -1,3 +1,5 @@
+edition = "orongo"
+
 [package]
 name = "rongo"
 version = "0.6.0"

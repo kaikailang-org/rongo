@@ -30,8 +30,8 @@ jobs:
       # version and verify the sha256 (the value the Homebrew formula used).
       - name: Install kaikai (release tarball)
         env:
-          KAIKAI_VERSION: "0.98.0"
-          KAIKAI_SHA256: "96380ececfee0f72a73fe6be33b83f7a5f66da97fe86cab107ccf6a13854da4f"
+          KAIKAI_VERSION: "0.104.0"
+          KAIKAI_SHA256: "078f2a2693aaf81def35b740f6b14b7670beb1fd7e4a922a27b1e5d190a9541c"
         run: |
           tarball="kaikai-v${KAIKAI_VERSION}-darwin-arm64.tar.gz"
           url="https://github.com/kaikailang-org/kaikai/releases/download/v${KAIKAI_VERSION}/${tarball}"

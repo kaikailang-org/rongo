@@ -4,6 +4,7 @@
 # whether a host has room for one more idle connection (the per-host cap).
 
 import rongo.pool
+
 import time
 
 # Fabricate an Instant n nanoseconds after the epoch. `is_fresh` only cares
@@ -12,17 +13,17 @@ fn at(ns: Int) : Instant = instant_of_nanos(ns)
 
 test "an idle connection younger than max_idle is fresh" {
   # since = 0ns, now = 1s, max_idle = 2s → aged 1s < 2s → fresh.
-  assert pool.is_fresh(at(0), at(1_000_000_000), seconds(2))
+  assert pool.is_fresh(at(0), at(1000000000), seconds(2))
 }
 
 test "an idle connection older than max_idle is stale" {
   # aged 3s, max_idle 2s → not fresh.
-  assert not pool.is_fresh(at(0), at(3_000_000_000), seconds(2))
+  assert not pool.is_fresh(at(0), at(3000000000), seconds(2))
 }
 
 test "idle age exactly at max_idle is stale (strict less-than)" {
   # aged exactly 2s, max_idle 2s → 2s < 2s is false → stale.
-  assert not pool.is_fresh(at(0), at(2_000_000_000), seconds(2))
+  assert not pool.is_fresh(at(0), at(2000000000), seconds(2))
 }
 
 test "a host below the cap has room" {

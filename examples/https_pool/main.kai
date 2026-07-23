@@ -23,16 +23,12 @@ Build & run (from the repo root):
 """)]
 
 import rongo.pool
+
 import net.http
 
-fn main() : Unit / Console + NetTcp + Ffi + Mutable + Clock = {
+fn main() : Unit / Console + NetTcp + Ffi + Mutable + Clock {
   let p = pool.new_pool(pool.default_pool_config())
-  let urls = ["https://postman-echo.com/get?n=1",
-              "https://postman-echo.com/get?n=2",
-              "https://postman-echo.com/get?n=3",
-              "https://postman-echo.com/get?n=4",
-              "https://postman-echo.com/get?n=5",
-              "https://postman-echo.com/get?n=6"]
+  let urls = ["https://postman-echo.com/get?n=1", "https://postman-echo.com/get?n=2", "https://postman-echo.com/get?n=3", "https://postman-echo.com/get?n=4", "https://postman-echo.com/get?n=5", "https://postman-echo.com/get?n=6"]
   urls | (url => {
     let resp = pool.get(p, url)
     print("#{url} -> #{int_to_string(resp.status)} (#{int_to_string(string_length(resp.body))} bytes)")

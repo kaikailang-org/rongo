@@ -15,7 +15,9 @@ bodies. No keep-alive, no compression, no cookies.
 """)]
 
 import net.http
+
 import net.tcp
+
 import rongo.ffi.tls
 
 # ---- HTTPS URL parsing --------------------------------------------
@@ -24,24 +26,28 @@ import rongo.ffi.tls
 # own parser. Shape: `https://<host>[:<port>][/<path>]`, default port
 # 443, path normalised to begin with `/`.
 
-fn find(hay: String, needle: String) : Int = find_loop(hay, needle, 0,
-  string_length(hay), string_length(needle))
+fn find(hay: String, needle: String) : Int = find_loop(hay, needle, 0, string_length(hay), string_length(needle))
 
-fn find_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int =
-  if nn == 0 { 0 }
-  else if i + nn > hn { 0 - 1 }
-  else if string_slice(hay, i, nn) == needle { i }
-  else { find_loop(hay, needle, i + 1, hn, nn) }
+fn find_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int = if nn == 0 {
+  0
+} else if (i + nn) > hn {
+  0 - 1
+} else if string_slice(hay, i, nn) == needle {
+  i
+} else {
+  find_loop(hay, needle, i + 1, hn, nn)
+}
 
-fn split_authority(auth: String) : http.HttpHostPort = {
+fn split_authority(auth: String) : http.HttpHostPort {
   let i = find(auth, ":")
-  if i < 0 { http.HttpHostPort { host: auth, port: 0 } }
-  else {
+  if i < 0 {
+    http.HttpHostPort { host: auth, port: 0 }
+  } else {
     let h = string_slice(auth, 0, i)
-    let rest = string_slice(auth, i + 1, string_length(auth) - i - 1)
+    let rest = string_slice(auth, i + 1, (string_length(auth) - i) - 1)
     match string_to_int(rest) {
       Some(p) -> http.HttpHostPort { host: h, port: p }
-      None    -> http.HttpHostPort { host: h, port: 0 }
+      None -> http.HttpHostPort { host: h, port: 0 }
     }
   }
 }
@@ -50,24 +56,39 @@ fn split_authority(auth: String) : http.HttpHostPort = {
 Parse an `https://` URL. Rejects any other scheme — `http://` belongs to
 `net.http`, and rongo is specifically the TLS lane. Default port is 443.
 """)]
-pub fn parse_url(s: String) : Result[String, http.HttpUrl] = {
+pub fn parse_url(s: String) : Result[http.HttpUrl, String] {
   let sep = "://"
-  let i   = find(s, sep)
-  if i < 0 { Err("https.parse_url: missing scheme separator '://'") }
-  else {
+  let i = find(s, sep)
+  if i < 0 {
+    Err("https.parse_url: missing scheme separator '://'")
+  } else {
     let scheme = string_slice(s, 0, i)
-    let rest   = string_slice(s, i + 3, string_length(s) - i - 3)
+    let rest = string_slice(s, i + 3, (string_length(s) - i) - 3)
     if scheme != "https" {
       Err("https.parse_url: only https:// is supported (got '#{scheme}://')")
     } else {
       let path_at = find(rest, "/")
-      let auth = if path_at < 0 { rest } else { string_slice(rest, 0, path_at) }
-      let path = if path_at < 0 { "/" }
-                 else { string_slice(rest, path_at, string_length(rest) - path_at) }
-      let hp   = split_authority(auth)
-      let port = if hp.port == 0 { 443 } else { hp.port }
-      if string_length(hp.host) == 0 { Err("https.parse_url: empty host") }
-      else { Ok(http.HttpUrl { scheme: "https", host: hp.host, port: port, path: path }) }
+      let auth = if path_at < 0 {
+        rest
+      } else {
+        string_slice(rest, 0, path_at)
+      }
+      let path = if path_at < 0 {
+        "/"
+      } else {
+        string_slice(rest, path_at, string_length(rest) - path_at)
+      }
+      let hp = split_authority(auth)
+      let port = if hp.port == 0 {
+        443
+      } else {
+        hp.port
+      }
+      if string_length(hp.host) == 0 {
+        Err("https.parse_url: empty host")
+      } else {
+        Ok(http.HttpUrl { scheme: "https", host: hp.host, port: port, path: path })
+      }
     }
   }
 }
@@ -78,21 +99,25 @@ pub fn parse_url(s: String) : Result[String, http.HttpUrl] = {
 # our own parsed URL — net.http's serialiser routes through its
 # parse_url, which would reject the https URL before framing.
 
-fn format_header(h: http.HttpHeader) : String =
-  string_concat_all([h.name, ": ", h.value, "\r\n"])
+fn format_header(h: http.HttpHeader) : String = string_concat_all([h.name, ": ", h.value, "\r\n"])
 
-fn format_headers(hs: [http.HttpHeader]) : String =
-  string_concat_all(list.map(hs, format_header))
+fn format_headers(hs: [http.HttpHeader]) : String = string_concat_all(list.map(hs, format_header))
 
-fn host_header(u: http.HttpUrl) : String =
-  if u.port == 443 { u.host }
-  else { string_concat_all([u.host, ":", int_to_string(u.port)]) }
+fn host_header(u: http.HttpUrl) : String = if u.port == 443 {
+  u.host
+} else {
+  string_concat_all([u.host, ":", int_to_string(u.port)])
+}
 
-fn serialize(u: http.HttpUrl, req: http.Request) : String = {
-  let path  = if string_length(u.path) == 0 { "/" } else { u.path }
+fn serialize(u: http.HttpUrl, req: http.Request) : String {
+  let path = if string_length(u.path) == 0 {
+    "/"
+  } else {
+    u.path
+  }
   let line1 = string_concat_all([req.method, " ", path, " HTTP/1.1\r\n"])
-  let host  = string_concat_all(["Host: ", host_header(u), "\r\n"])
-  let clen  = string_concat_all(["Content-Length: ", int_to_string(string_length(req.body)), "\r\n"])
+  let host = string_concat_all(["Host: ", host_header(u), "\r\n"])
+  let clen = string_concat_all(["Content-Length: ", int_to_string(string_length(req.body)), "\r\n"])
   # No `Connection: close`: HTTP/1.1 defaults to keep-alive, and the read
   # loop frames the response by Content-Length / chunked, so it does not
   # depend on the peer closing. A caller wanting a one-shot close adds the
@@ -111,27 +136,33 @@ fn serialize(u: http.HttpUrl, req: http.Request) : String = {
 
 # `method` is the request verb: a HEAD response never carries a body
 # regardless of its headers, so it completes at the blank line.
-fn recv_response(c: tls.TlsConn, method: String) : Result[String, String] / NetTcp + Ffi =
-  recv_response_loop(c, method, [])
+fn recv_response(c: tls.TlsConn, method: String) : Result[String, String] / NetTcp + Ffi = recv_response_loop(c, method, [])
 
-fn recv_response_loop(c: tls.TlsConn, method: String, acc_rev: [Int])
-    : Result[String, String] / NetTcp + Ffi = {
+fn recv_response_loop(c: tls.TlsConn, method: String, acc_rev: [Int]) : Result[String, String] / NetTcp + Ffi {
   let raw = http.bytes_to_string(list_reverse(acc_rev))
-  if response_complete(raw, method) { Ok(raw) }
-  else { match tls.recv(c, 4096) {
-    Err(e)    -> Err(e)
-    Ok(chunk) -> match chunk {
-      # Peer closed: take what parsed as complete, else report truncation.
-      [] -> if response_complete(raw, method) { Ok(raw) }
-            else if string_length(raw) > 0 { Ok(raw) }   # body-to-EOF (no framing) ended by close
-            else { Err("https: peer closed before any response") }
-      _  -> recv_response_loop(c, method, prepend(chunk, acc_rev))
+  if response_complete(raw, method) {
+    Ok(raw)
+  } else {
+    match tls.recv(c, 4096) {
+      Err(e) -> Err(e)
+      Ok(chunk) -> match chunk {
+        [] -> 
+        # Peer closed: take what parsed as complete, else report truncation.
+        if response_complete(raw, method) {
+          Ok(raw)
+        } else if string_length(raw) > 0 {
+          Ok(raw)  # body-to-EOF (no framing) ended by close
+        } else {
+          Err("https: peer closed before any response")
+        }
+        _ -> recv_response_loop(c, method, prepend(chunk, acc_rev))
+      }
     }
-  } }
+  }
 }
 
 fn prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
-  []           -> acc
+  [] -> acc
   [b, ...rest] -> prepend(rest, [b, ...acc])
 }
 
@@ -144,43 +175,53 @@ fn prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
 #   - none of the above: the body runs to connection close (no keep-alive
 #     framing) — never "complete" until the peer closes (handled by the
 #     recv loop's EOF branch).
-fn response_complete(raw: String, method: String) : Bool = {
+fn response_complete(raw: String, method: String) : Bool {
   let sep = "\r\n\r\n"
-  let i   = find(raw, sep)
-  if i < 0 { false }
-  else {
-    let head       = string_slice(raw, 0, i)
+  let i = find(raw, sep)
+  if i < 0 {
+    false
+  } else {
+    let head = string_slice(raw, 0, i)
     let body_start = i + string_length(sep)
-    let body_len   = string_length(raw) - body_start
-    let status     = status_of(head)
-    if bodyless(method, status) { true }
-    else {
+    let body_len = string_length(raw) - body_start
+    let status = status_of(head)
+    if bodyless(method, status) {
+      true
+    } else {
       let hdrs = parse_headers(head)
       match header_ci(hdrs, "transfer-encoding") {
-        Some(te) -> if contains_ci(te, "chunked") { chunked_complete(raw, body_start) }
-                    else { false }
+        Some(te) -> if contains_ci(te, "chunked") {
+          chunked_complete(raw, body_start)
+        } else {
+          false
+        }
         None -> match header_ci(hdrs, "content-length") {
-          Some(v) -> match string_to_int(trim(v)) { Some(n) -> body_len >= n  None -> false }
-          None    -> false          # body-to-close: only the EOF branch completes it
+          Some(v) -> match string_to_int(trim(v)) {
+            Some(n) -> body_len >= n
+            None -> false
+          }
+          None -> false
         }
       }
     }
   }
-}
+}  # body-to-close: only the EOF branch completes it
 
 # A response with no body by spec: HEAD request, or an informational /
 # no-content / not-modified status.
-fn bodyless(method: String, status: Int) : Bool =
-  method == "HEAD" or (status >= 100 and status < 200) or status == 204 or status == 304
+fn bodyless(method: String, status: Int) : Bool = (((method == "HEAD") or ((status >= 100) and (status < 200))) or (status == 204)) or (status == 304)
 
 # Parse the status code out of the status line (`HTTP/1.1 <code> ...`).
-fn status_of(head: String) : Int = {
+fn status_of(head: String) : Int {
   let line = match string_split(head, "\r\n") {
-    [l, ..._] -> l
-    []        -> ""
+    [l, ...__list_rest_179_12__] -> l
+    [] -> ""
   }
   match string_split(line, " ") {
-    [_proto, code, ..._] -> match string_to_int(code) { Some(n) -> n  None -> 0 }
+    [_proto, code, ...__list_rest_183_23__] -> match string_to_int(code) {
+      Some(n) -> n
+      None -> 0
+    }
     _ -> 0
   }
 }
@@ -193,59 +234,83 @@ fn status_of(head: String) : Int = {
 # at the blank line, so we require the closing `\r\n\r\n` measured from
 # the terminator's size line — otherwise trailers left unconsumed would
 # corrupt the next request on a keep-alive connection.
-fn chunked_complete(raw: String, pos: Int) : Bool = {
+fn chunked_complete(raw: String, pos: Int) : Bool {
   let crlf = find_from(raw, "\r\n", pos)
-  if crlf < 0 { false }                          # size line not fully arrived
-  else {
+  if crlf < 0 {
+    false  # size line not fully arrived
+  } else {
     let size_str = string_slice(raw, pos, crlf - pos)
     match parse_hex(trim(size_str)) {
-      None    -> false
+      None -> false
+      Some(
       # Terminator: the message ends at the blank line after it (with or
       # without a trailer block). Require that blank line to have arrived.
-      Some(0) -> find_from(raw, "\r\n\r\n", pos) >= 0
+      0) -> find_from(raw, "\r\n\r\n", pos) >= 0
       Some(n) -> {
         # Skip this chunk's data + its trailing CRLF, then continue.
         let data_start = crlf + 2
-        let next = data_start + n + 2
-        if next > string_length(raw) { false }    # chunk not fully arrived
-        else { chunked_complete(raw, next) }
+        let next = (data_start + n) + 2
+        if next > string_length(raw) {
+          false  # chunk not fully arrived
+        } else {
+          chunked_complete(raw, next)
+        }
       }
     }
   }
 }
 
-fn find_from(hay: String, needle: String, from: Int) : Int = {
+fn find_from(hay: String, needle: String, from: Int) : Int {
   let hn = string_length(hay)
   let nn = string_length(needle)
   find_from_loop(hay, needle, from, hn, nn)
 }
-fn find_from_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int =
-  if i + nn > hn { 0 - 1 }
-  else if string_slice(hay, i, nn) == needle { i }
-  else { find_from_loop(hay, needle, i + 1, hn, nn) }
 
-fn parse_hex(s: String) : Option[Int] = {
-  let n = string_length(s)
-  if n == 0 { None } else { parse_hex_loop(s, 0, n, 0) }
+fn find_from_loop(hay: String, needle: String, i: Int, hn: Int, nn: Int) : Int = if (i + nn) > hn {
+  0 - 1
+} else if string_slice(hay, i, nn) == needle {
+  i
+} else {
+  find_from_loop(hay, needle, i + 1, hn, nn)
 }
-fn parse_hex_loop(s: String, i: Int, n: Int, acc: Int) : Option[Int] =
-  if i >= n { Some(acc) }
-  else { match char_at(s, i) {
+
+fn parse_hex(s: String) : Option[Int] {
+  let n = string_length(s)
+  if n == 0 {
+    None
+  } else {
+    parse_hex_loop(s, 0, n, 0)
+  }
+}
+
+fn parse_hex_loop(s: String, i: Int, n: Int, acc: Int) : Option[Int] = if i >= n {
+  Some(acc)
+} else {
+  match char_at(s, i) {
     None -> Some(acc)
-    Some(c) -> match hex_digit(c) { None -> Some(acc)  Some(v) -> parse_hex_loop(s, i + 1, n, acc * 16 + v) }
-  } }
-fn hex_digit(c: Char) : Option[Int] =
-  if c >= '0' and c <= '9' { Some(char_to_int(c) - char_to_int('0')) }
-  else if c >= 'a' and c <= 'f' { Some(char_to_int(c) - char_to_int('a') + 10) }
-  else if c >= 'A' and c <= 'F' { Some(char_to_int(c) - char_to_int('A') + 10) }
-  else { None }
+    Some(c) -> match hex_digit(c) {
+      None -> Some(acc)
+      Some(v) -> parse_hex_loop(s, i + 1, n, (acc * 16) + v)
+    }
+  }
+}
+
+fn hex_digit(c: Char) : Option[Int] = if (c >= '0') and (c <= '9') {
+  Some(char_to_int(c) - char_to_int('0'))
+} else if (c >= 'a') and (c <= 'f') {
+  Some((char_to_int(c) - char_to_int('a')) + 10)
+} else if (c >= 'A') and (c <= 'F') {
+  Some((char_to_int(c) - char_to_int('A')) + 10)
+} else {
+  None
+}
 
 # Minimal case-insensitive header parse over the header block (skip the
 # status line). Returns [(name-lower, value)].
-fn parse_headers(head: String) : [http.HttpHeader] = {
+fn parse_headers(head: String) : [http.HttpHeader] {
   let lines = string_split(head, "\r\n")
   match lines {
-    []           -> []
+    [] -> []
     [_, ...rest] -> parse_header_lines(rest, [])
   }
 }
@@ -254,10 +319,11 @@ fn parse_header_lines(lines: [String], acc: [http.HttpHeader]) : [http.HttpHeade
   [] -> list_reverse(acc)
   [l, ...rest] -> {
     let i = find(l, ":")
-    if i < 0 { parse_header_lines(rest, acc) }
-    else {
+    if i < 0 {
+      parse_header_lines(rest, acc)
+    } else {
       let nm = lower(string_slice(l, 0, i))
-      let vl = trim(string_slice(l, i + 1, string_length(l) - i - 1))
+      let vl = trim(string_slice(l, i + 1, (string_length(l) - i) - 1))
       parse_header_lines(rest, [http.HttpHeader { name: nm, value: vl }, ...acc])
     }
   }
@@ -265,44 +331,85 @@ fn parse_header_lines(lines: [String], acc: [http.HttpHeader]) : [http.HttpHeade
 
 fn header_ci(hs: [http.HttpHeader], name_lower: String) : Option[String] = match hs {
   [] -> None
-  [h, ...rest] -> if h.name == name_lower { Some(h.value) } else { header_ci(rest, name_lower) }
+  [h, ...rest] -> if h.name == name_lower {
+    Some(h.value)
+  } else {
+    header_ci(rest, name_lower)
+  }
 }
 
 fn lower(s: String) : String = string_concat_all(list.map(char_list(s), lower_char))
-fn lower_char(c: Char) : String = if c >= 'A' and c <= 'Z' { "#{int_to_char(char_to_int(c) + 32)}" } else { "#{c}" }
+
+fn lower_char(c: Char) : String = if (c >= 'A') and (c <= 'Z') {
+  "#{int_to_char(char_to_int(c) + 32)}"
+} else {
+  "#{c}"
+}
+
 fn char_list(s: String) : [Char] = char_list_loop(s, 0, string_length(s), [])
-fn char_list_loop(s: String, i: Int, n: Int, acc: [Char]) : [Char] =
-  if i >= n { list_reverse(acc) }
-  else { match char_at(s, i) { Some(c) -> char_list_loop(s, i + 1, n, [c, ...acc])  None -> list_reverse(acc) } }
 
-fn contains_ci(hay: String, needle_lower: String) : Bool =
-  find(lower(hay), needle_lower) >= 0
+fn char_list_loop(s: String, i: Int, n: Int, acc: [Char]) : [Char] = if i >= n {
+  list_reverse(acc)
+} else {
+  match char_at(s, i) {
+    Some(c) -> char_list_loop(s, i + 1, n, [c, ...acc])
+    None -> list_reverse(acc)
+  }
+}
 
-fn trim(s: String) : String = {
+fn contains_ci(hay: String, needle_lower: String) : Bool = find(lower(hay), needle_lower) >= 0
+
+fn trim(s: String) : String {
   let n = string_length(s)
   let lo = ltrim(s, 0, n)
   let hi = rtrim(s, n)
-  if hi <= lo { "" } else { string_slice(s, lo, hi - lo) }
+  if hi <= lo {
+    ""
+  } else {
+    string_slice(s, lo, hi - lo)
+  }
 }
-fn is_ws(c: Char) : Bool = c == ' ' or c == '\t' or c == '\r' or c == '\n'
-fn ltrim(s: String, i: Int, n: Int) : Int =
-  if i >= n { i } else { match char_at(s, i) { Some(c) -> if is_ws(c) { ltrim(s, i + 1, n) } else { i }  None -> i } }
-fn rtrim(s: String, i: Int) : Int =
-  if i <= 0 { 0 } else { match char_at(s, i - 1) { Some(c) -> if is_ws(c) { rtrim(s, i - 1) } else { i }  None -> i } }
+
+fn is_ws(c: Char) : Bool = (((c == ' ') or (c == '\t')) or (c == '\r')) or (c == '\n')
+
+fn ltrim(s: String, i: Int, n: Int) : Int = if i >= n {
+  i
+} else {
+  match char_at(s, i) {
+    Some(c) -> if is_ws(c) {
+      ltrim(s, i + 1, n)
+    } else {
+      i
+    }
+    None -> i
+  }
+}
+
+fn rtrim(s: String, i: Int) : Int = if i <= 0 {
+  0
+} else {
+  match char_at(s, i - 1) {
+    Some(c) -> if is_ws(c) {
+      rtrim(s, i - 1)
+    } else {
+      i
+    }
+    None -> i
+  }
+}
 
 # Run one request/response exchange over an already-open connection `c`
 # for URL `u`. Does NOT open or close `c` — that is the caller's (so a
 # session can reuse it). Returns the parsed Response, or a status-0
 # Response carrying the error.
-fn exchange(c: tls.TlsConn, u: http.HttpUrl, req: http.Request)
-    : http.Response / NetTcp + Ffi = {
+fn exchange(c: tls.TlsConn, u: http.HttpUrl, req: http.Request) : http.Response / NetTcp + Ffi {
   let wire = serialize(u, req)
   match tls.send(c, http.string_to_bytes(wire)) {
     Err(e) -> http.Response { status: 0, headers: [], body: string_concat("send: ", e) }
-    Ok(_)  -> match recv_response(c, req.method) {
+    Ok(_) -> match recv_response(c, req.method) {
       Err(e) -> http.Response { status: 0, headers: [], body: string_concat("recv: ", e) }
       Ok(raw) -> match http.parse_response(raw) {
-        Ok(r)  -> r
+        Ok(r) -> r
         Err(e) -> http.Response { status: 0, headers: [], body: e }
       }
     }
@@ -317,11 +424,10 @@ failure or transport error collapses to a status-0 `Response`, matching
 `request`'s contract. This is `session_request` without the `Session`
 wrapper — the piece a connection pool drives.
 """)]
-pub fn exchange_on(c: tls.TlsConn, req: http.Request) : http.Response / NetTcp + Ffi =
-  match parse_url(req.url) {
-    Err(e) -> http.Response { status: 0, headers: [], body: e }
-    Ok(u)  -> exchange(c, u, req)
-  }
+pub fn exchange_on(c: tls.TlsConn, req: http.Request) : http.Response / NetTcp + Ffi = match parse_url(req.url) {
+  Err(e) -> http.Response { status: 0, headers: [], body: e }
+  Ok(u) -> exchange(c, u, req)
+}
 
 #[doc("""
 Issue `req` over a fresh TLS connection and return the parsed `Response`.
@@ -330,12 +436,12 @@ one request per connection. For several requests to one host, use
 `open_session`. Any failure collapses to a status-0 `Response` with the
 error in `body`, matching net.http.request's contract.
 """)]
-pub fn request(req: http.Request) : http.Response / NetTcp + Ffi = {
+pub fn request(req: http.Request) : http.Response / NetTcp + Ffi {
   match parse_url(req.url) {
     Err(e) -> http.Response { status: 0, headers: [], body: e }
-    Ok(u)  -> match tls.connect(u.host, u.port) {
+    Ok(u) -> match tls.connect(u.host, u.port) {
       Err(e) -> http.Response { status: 0, headers: [], body: string_concat("connect: ", e) }
-      Ok(c)  -> {
+      Ok(c) -> {
         let resp = exchange(c, u, req)
         tls.close(c)
         resp
@@ -363,43 +469,34 @@ connection pooling.
 pub type Session = { priv conn: tls.TlsConn, priv host: String, priv port: Int }
 
 #[doc("Open a keep-alive session to `host:port`, verifying against the system trust store.")]
-pub fn open_session(host: String, port: Int) : Result[String, Session] / NetTcp + Ffi =
-  match tls.connect(host, port) {
-    Err(e) -> Err(e)
-    Ok(c)  -> Ok(Session { conn: c, host: host, port: port })
-  }
+pub fn open_session(host: String, port: Int) : Result[Session, String] / NetTcp + Ffi = match tls.connect(host, port) {
+  Err(e) -> Err(e)
+  Ok(c) -> Ok(Session { conn: c, host: host, port: port })
+}
 
 #[doc("Open a keep-alive session, trusting a private CA (`ca_path`) for the server cert.")]
-pub fn open_session_ca(host: String, port: Int, ca_path: String)
-    : Result[String, Session] / NetTcp + Ffi =
-  match tls.connect_ca(host, port, ca_path) {
-    Err(e) -> Err(e)
-    Ok(c)  -> Ok(Session { conn: c, host: host, port: port })
-  }
+pub fn open_session_ca(host: String, port: Int, ca_path: String) : Result[Session, String] / NetTcp + Ffi = match tls.connect_ca(host, port, ca_path) {
+  Err(e) -> Err(e)
+  Ok(c) -> Ok(Session { conn: c, host: host, port: port })
+}
 
 #[doc("Issue `req` over the session's persistent connection. `req.url`'s path is used; its host must match the session.")]
-pub fn session_request(s: Session, req: http.Request) : http.Response / NetTcp + Ffi =
-  exchange_on(s.conn, req)
+pub fn session_request(s: Session, req: http.Request) : http.Response / NetTcp + Ffi = exchange_on(s.conn, req)
 
 #[doc("GET `url` over the session's persistent connection.")]
-pub fn session_get(s: Session, url: String) : http.Response / NetTcp + Ffi =
-  session_request(s, http.Request { method: "GET", url: url, headers: [], body: "" })
+pub fn session_get(s: Session, url: String) : http.Response / NetTcp + Ffi = session_request(s, http.Request { method: "GET", url: url, headers: [], body: "" })
 
 #[doc("Close a keep-alive session (TLS shutdown + transport close).")]
 pub fn close_session(s: Session) : Unit / NetTcp + Ffi = tls.close(s.conn)
 
 #[doc("Issues an HTTPS GET to `url` with no extra headers and returns the response.")]
-pub fn get(url: String) : http.Response / NetTcp + Ffi =
-  request(http.Request { method: "GET", url: url, headers: [], body: "" })
+pub fn get(url: String) : http.Response / NetTcp + Ffi = request(http.Request { method: "GET", url: url, headers: [], body: "" })
 
 #[doc("Issues an HTTPS POST to `url` carrying `body`, with no extra headers.")]
-pub fn post(url: String, body: String) : http.Response / NetTcp + Ffi =
-  request(http.Request { method: "POST", url: url, headers: [], body: body })
+pub fn post(url: String, body: String) : http.Response / NetTcp + Ffi = request(http.Request { method: "POST", url: url, headers: [], body: body })
 
 #[doc("Issues an HTTPS PUT to `url` carrying `body`, with no extra headers.")]
-pub fn put(url: String, body: String) : http.Response / NetTcp + Ffi =
-  request(http.Request { method: "PUT", url: url, headers: [], body: body })
+pub fn put(url: String, body: String) : http.Response / NetTcp + Ffi = request(http.Request { method: "PUT", url: url, headers: [], body: body })
 
 #[doc("Issues an HTTPS DELETE to `url` with no extra headers.")]
-pub fn delete(url: String) : http.Response / NetTcp + Ffi =
-  request(http.Request { method: "DELETE", url: url, headers: [], body: "" })
+pub fn delete(url: String) : http.Response / NetTcp + Ffi = request(http.Request { method: "DELETE", url: url, headers: [], body: "" })
