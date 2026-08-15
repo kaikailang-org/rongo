@@ -1,0 +1,9 @@
+import ffi.tls
+
+fn main() : Int / NetTcp + Ffi = match tls.connect("127.0.0.1", 1) {
+  Ok(connection) -> {
+    tls.close(connection)
+    0
+  }
+  Err(_) -> 0
+}

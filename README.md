@@ -118,8 +118,11 @@ See `examples/` for runnable versions (`https_get`, `https_post`,
 ## Build
 
 The kaikai bindings link against the `ffi/tls_openssl.c` OpenSSL shim,
-which needs OpenSSL's headers and libs. Both are fed through `CFLAGS`,
-resolved by `pkg-config`:
+which needs OpenSSL's headers and libraries. Rongo declares the shim plus
+`ssl` and `crypto` in its `[native]` package contract, so they propagate to
+consumers automatically. The Makefile uses `pkg-config` only to locate system
+headers and library search paths on installations such as Homebrew's keg-only
+OpenSSL:
 
 ```sh
 make                    # build the demo (a live https.get)
@@ -132,6 +135,7 @@ make example-server     # examples/tls_echo          (TLS server + client, one p
 make example-mtls       # examples/mtls              (mutual TLS, both halves rongo)
 make example-http-server # examples/http_server      (HTTPS server + client, keep-alive)
 make test               # tests (pure parsers + effect mock, no network)
+make test-native-package # transitive native-dependency consumer build
 ```
 
 `kai test` covers the pure URL parser and the `Tls` effect against a
@@ -149,6 +153,16 @@ high-level API; hostname verification binds `SSL_set1_dnsname` on 4.0,
 `SSL_set1_host` before). On macOS with Homebrew's keg-only `openssl@4`,
 the Makefile points `pkg-config` at its directory; on Linux the system
 OpenSSL is found without help.
+
+A direct consumer normally needs only the Rongo dependency. When OpenSSL's
+headers are keg-only, expose their include directory while Rongo's manifest
+continues to supply the shim and link libraries:
+
+```sh
+CFLAGS="$(pkg-config --cflags openssl) $(pkg-config --libs-only-L openssl)" kai build .
+```
+
+Transitive `[native]` dependencies require Kaikai 0.112.0 or newer.
 
 ## Install
 

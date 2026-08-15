@@ -1,4 +1,5 @@
 /build/
+.kai-cache/
 kai.toml.bak
 .kai.example.toml
 
