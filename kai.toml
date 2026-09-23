@@ -1,4 +1,4 @@
-edition = "orongo"
+edition = "hanga-roa"
 
 [package]
 name = "rongo"

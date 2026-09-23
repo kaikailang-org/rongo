@@ -1,6 +1,6 @@
 name = "rongo-native-consumer"
 version = "0.1.0"
-edition = "orongo"
+edition = "hanga-roa"
 entry = "main.kai"
 
 [dependencies]
