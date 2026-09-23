@@ -6,8 +6,7 @@ length. The whole point of rongo's TLS lane in one program: this is the
 Build & run (from the repo root):
   make example && ./build/https_get
 Or directly:
-  CFLAGS="-std=c99 ffi/tls_openssl.c $(pkg-config --cflags --libs openssl)" \
-    kai run ./examples/https_get
+  CFLAGS="-std=c99 ffi/tls_openssl.c $(pkg-config --cflags --libs openssl)" kai run ./examples/https_get
 """)]
 
 import rongo.https
