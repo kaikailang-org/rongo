@@ -42,6 +42,8 @@ import rongo.ffi.tls
 
 import spawn
 
+import actor
+
 #[doc("""
 Server configuration. `max_request_bytes` caps how much one request may
 buffer (a header/body flood defense); `max_connections` caps how many
@@ -134,13 +136,18 @@ fn prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
 # request.
 pub fn request_complete(raw: String) : Bool {
   let sep = "\r\n\r\n"
+  # Both lengths are read before `find`: on kaikai 0.123 a String handed to
+  # a forwarding call is freed at the call, so a later read of `sep` or
+  # `raw` sees freed memory (docs/known-regressions.md).
+  let sep_len = string_length(sep)
+  let raw_len = string_length(raw)
   let i = find(raw, sep)
   if i < 0 {
     false
   } else {
     let head = string_slice(raw, 0, i)
-    let body_start = i + string_length(sep)
-    let body_len = string_length(raw) - body_start
+    let body_start = i + sep_len
+    let body_len = raw_len - body_start
     if is_chunked(head) {
       true  # stop here; handle_conn rejects it
     } else {
@@ -203,12 +210,11 @@ fn send_error(c: tls.TlsConn, status: Int, msg: String) : Unit / NetTcp + Ffi {
   tls.close(c)
 }
 
-# Serve requests on `c`, decrementing the active-connection counter `live`
-# when the connection ends (any exit path). `active` is the counter serve
-# uses to enforce `max_connections`.
-fn handle_conn[e](c: tls.TlsConn, cfg: Config, live: Ref[Int], handler: (http.Request) -> http.Response / e) : Unit / NetTcp + Ffi + Spawn + Mutable + e {
+# Serve requests on `c`, reporting the connection's end to `parent` on any
+# exit path so the accept loop can free its slot.
+fn handle_conn[e](c: tls.TlsConn, cfg: Config, parent: Pid[ConnMsg], handler: (http.Request) -> http.Response / e) : Unit / NetTcp + Ffi + Spawn + Actor[ConnMsg] + e {
   serve_requests(c, cfg, handler)
-  Mutable.ref_set(live, Mutable.ref_get(live) - 1)  # connection done: free its slot
+  Actor.send(parent, ConnDone)
 }
 
 # The keep-alive request loop for one connection. Self-tail-recurses per
@@ -292,34 +298,55 @@ it loops accepting; cancel it to stop.
 The handler's effect row `e` flows through unchanged, so a handler may read
 files, log, or perform any effect the caller installs a handler for.
 """)]
-pub fn serve[e](l: tls.TlsListener, handler: (http.Request) -> http.Response / e) : Unit / NetTcp + Ffi + Spawn + Mutable + e = serve_with(l, default_config(), handler)
+pub fn serve[e](l: tls.TlsListener, handler: (http.Request) -> http.Response / e) : Unit / NetTcp + Ffi + Spawn + e = serve_with(l, default_config(), handler)
 
 #[doc("Like `serve`, with an explicit `Config` (request cap, connection cap, keep-alive).")]
-pub fn serve_with[e](l: tls.TlsListener, cfg: Config, handler: (http.Request) -> http.Response / e) : Unit / NetTcp + Ffi + Spawn + Mutable + e {
-  # `live` counts connections currently being served, so the accept loop can
-  # cap concurrency. The nursery scope owns every connection fiber: on cancel
-  # it joins / cancels them all, so `serve` shuts down cleanly.
-  let live = Mutable.ref_make(0)
+pub fn serve_with[e](l: tls.TlsListener, cfg: Config, handler: (http.Request) -> http.Response / e) : Unit / NetTcp + Ffi + Spawn + e {
+  # The nursery scope owns every connection fiber: on cancel it joins /
+  # cancels them all, so `serve` shuts down cleanly. The mailbox is how
+  # those fibers report back; it belongs to the accept loop's own fiber.
   nursery(() => {
-    accept_loop(l, cfg, live, handler)
+    with_mailbox(() => accept_loop(l, cfg, 0, handler))
   })
 }
 
-fn accept_loop[e](l: tls.TlsListener, cfg: Config, live: Ref[Int], handler: (http.Request) -> http.Response / e) : Unit / NetTcp + Ffi + Spawn + Mutable + e {
+# ---- the active-connection counter --------------------------------
+#
+# `max_connections` needs a count of the connections in flight, which the
+# accept loop reads and every connection fiber decrements as it ends. That
+# count cannot be a `Ref` handed across the spawn boundary: fibers have
+# private heaps, so the child would mutate a copy. The accept loop owns the
+# count as a plain `Int` threaded through its own recursion, and each
+# connection fiber reports its exit by message.
+type ConnMsg = | ConnDone
+
+# Subtract the connections that ended since the last look. A zero-nanosecond
+# receive polls the mailbox without parking, so the accept loop never blocks
+# on a number it only needs to be current at the moment it decides.
+fn drain_done(live: Int) : Int / Actor[ConnMsg] = match Actor.receive_timeout(0) {
+  None -> live
+  Some(ConnDone) -> drain_done(live - 1)
+}
+
+fn accept_loop[e](l: tls.TlsListener, cfg: Config, live: Int, handler: (http.Request) -> http.Response / e) : Unit / NetTcp + Ffi + Spawn + Actor[ConnMsg] + e {
   match tls.accept(l) {
     Err(_) -> accept_loop(l, cfg, live, handler)
     Ok(c) -> 
     # failed handshake: skip, keep serving
     {
-      if Mutable.ref_get(live) >= cfg.max_connections {
+      # Drain first: the count is read right after an accept, the only
+      # moment the cap is enforced, so it is current where it matters.
+      let n = drain_done(live)
+      if n >= cfg.max_connections {
         # At capacity: drop the connection immediately rather than spawn a
         # fiber for it. A flood of connections can't outgrow the cap.
         tls.close(c)
+        accept_loop(l, cfg, n, handler)
       } else {
-        Mutable.ref_set(live, Mutable.ref_get(live) + 1)
-        let _ = Spawn.spawn(() => handle_conn(c, cfg, live, handler))
+        let me = Actor.self()
+        let _ = spawn_actor(() => handle_conn(c, cfg, me, handler))
+        accept_loop(l, cfg, n + 1, handler)
       }
-      accept_loop(l, cfg, live, handler)
     }
   }
 }
