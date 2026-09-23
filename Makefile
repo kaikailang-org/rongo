@@ -1,6 +1,7 @@
 # rongo — TLS lane over OpenSSL. The kaikai bindings link against the
 # `ffi/tls_openssl.c` slot-table shim, which needs OpenSSL's headers and
-# libs; both are fed through CFLAGS, exactly as uira feeds raylib.
+# libs. kai.toml carries the shim and link libraries transitively; CFLAGS
+# only supplies keg-specific include/library search paths from pkg-config.
 #
 # The emitted out.c must NOT see <openssl/ssl.h> — kaikai has no OpenSSL
 # typedefs to collide, but the invariant is the same as uira's: the shim
@@ -26,15 +27,15 @@ else
   PKG_ENV :=
 endif
 
-OPENSSL_CFLAGS := $(shell $(PKG_ENV) pkg-config --cflags openssl)
-OPENSSL_LIBS   := $(shell $(PKG_ENV) pkg-config --libs openssl)
-
+OPENSSL_CFLAGS  := $(shell $(PKG_ENV) pkg-config --cflags openssl)
+OPENSSL_LDFLAGS := $(shell $(PKG_ENV) pkg-config --libs-only-L openssl)
 SHIM := ffi/tls_openssl.c
 
-KAI_CFLAGS := -std=c99 -O2 -Wall $(OPENSSL_CFLAGS) $(SHIM) $(OPENSSL_LIBS)
+KAI_CFLAGS := -std=c99 -O2 -Wall $(OPENSSL_CFLAGS) $(OPENSSL_LDFLAGS)
 
 .PHONY: all demo test example example-post example-concurrent example-keepalive \
-        example-pool example-server example-mtls example-http-server certs clean check-openssl
+        example-pool example-server example-mtls example-http-server \
+        test-native-package certs clean check-openssl
 
 # The `openssl` CLI from the same install pkg-config resolves.
 OPENSSL_BIN := $(shell $(PKG_ENV) pkg-config --variable=prefix openssl)/bin/openssl
@@ -144,6 +145,12 @@ build/http_server: examples/http_server/main.kai $(LIB_SRCS) http_server.kai | b
 # `kai test`; the shim is linked so the FFI externs resolve.
 test: $(SHIM)
 	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) test .
+
+# Build a separate package that depends on Rongo by path. This catches the
+# exact regression [native] solves: consumers must receive the shim and link
+# libraries transitively, without naming either in their own manifest.
+test-native-package: $(SHIM) | build
+	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) build ./tests/native_consumer -o build/native_consumer
 
 build:
 	mkdir -p build
