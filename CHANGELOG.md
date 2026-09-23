@@ -1,3 +1,9 @@
+## v0.7.1 (2026-09-23)
+
+### Fix
+
+- declare the hanga-roa edition, the only one the compiler provides
+
 ## v0.7.0 (2026-09-23)
 
 ### Fix
