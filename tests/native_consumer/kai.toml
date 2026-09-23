@@ -1,0 +1,7 @@
+name = "rongo-native-consumer"
+version = "0.1.0"
+edition = "orongo"
+entry = "main.kai"
+
+[dependencies]
+rongo = { path = "../.." }

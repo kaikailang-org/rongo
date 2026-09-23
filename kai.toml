@@ -4,3 +4,7 @@ edition = "orongo"
 name = "rongo"
 version = "0.6.0"
 entry = "rongo.kai"
+
+[native]
+sources = ["ffi/tls_openssl.c"]
+libs = ["ssl", "crypto"]
