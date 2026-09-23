@@ -177,13 +177,18 @@ fn prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
 #     recv loop's EOF branch).
 fn response_complete(raw: String, method: String) : Bool {
   let sep = "\r\n\r\n"
+  # Both lengths are read before `find`: on kaikai 0.123 a String handed to
+  # a forwarding call is freed at the call, so a later read of `sep` or
+  # `raw` sees freed memory (docs/known-regressions.md).
+  let sep_len = string_length(sep)
+  let raw_len = string_length(raw)
   let i = find(raw, sep)
   if i < 0 {
     false
   } else {
     let head = string_slice(raw, 0, i)
-    let body_start = i + string_length(sep)
-    let body_len = string_length(raw) - body_start
+    let body_start = i + sep_len
+    let body_len = raw_len - body_start
     let status = status_of(head)
     if bodyless(method, status) {
       true
