@@ -2,7 +2,7 @@ edition = "orongo"
 
 [package]
 name = "rongo"
-version = "0.6.0"
+version = "0.7.0"
 entry = "rongo.kai"
 
 [native]
