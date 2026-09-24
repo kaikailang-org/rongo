@@ -1,3 +1,9 @@
+## v0.8.0 (2026-09-24)
+
+### Fix
+
+- **ffi**: make the TLS handle tables thread-safe
+
 ## v0.7.2 (2026-09-24)
 
 ### Fix
