@@ -1,3 +1,9 @@
+## v0.7.2 (2026-09-24)
+
+### Fix
+
+- drop the string-length workaround, fixed upstream in 0.124.0
+
 ## v0.7.1 (2026-09-23)
 
 ### Fix
