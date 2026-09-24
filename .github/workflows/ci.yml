@@ -51,12 +51,14 @@ jobs:
         run: make test-native-package
 
       - name: Live GET over TLS
+        timeout-minutes: 1
         run: |
           make example
           ./build/https_get | tee /tmp/get.out
           grep -q "status: 200" /tmp/get.out
 
       - name: Live POST — the send path over a >16 KB body
+        timeout-minutes: 1
         run: |
           make example-post
           ./build/https_post | tee /tmp/post.out
@@ -64,6 +66,7 @@ jobs:
           grep -q "body echoed intact: yes" /tmp/post.out
 
       - name: Concurrent requests — one must not block the other
+        timeout-minutes: 1
         run: |
           make example-concurrent
           ./build/https_concurrent | tee /tmp/conc.out
