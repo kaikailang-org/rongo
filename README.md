@@ -162,7 +162,10 @@ continues to supply the shim and link libraries:
 CFLAGS="$(pkg-config --cflags openssl) $(pkg-config --libs-only-L openssl)" kai build .
 ```
 
-Transitive `[native]` dependencies require Kaikai 0.112.0 or newer.
+Requires kaikai 0.124.0 or newer. Transitive `[native]` dependencies
+need 0.112.0, but the HTTP framing predicates hit a reference-counting
+bug present through 0.123.0 that deadlocks both the server and the
+client lane at runtime — see `docs/known-regressions.md`.
 
 ## Install
 
