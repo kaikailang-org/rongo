@@ -2,7 +2,7 @@ edition = "hanga-roa"
 
 [package]
 name = "rongo"
-version = "0.7.2"
+version = "0.8.0"
 entry = "rongo.kai"
 
 [native]
