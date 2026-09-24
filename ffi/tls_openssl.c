@@ -16,6 +16,11 @@
  * so a fiber yielding mid-pump (NetTcp parks it during recv/send) cannot
  * corrupt another connection's data.
  *
+ * Threads: kaikai schedules fibers across OS threads, so two fibers can
+ * be inside this shim at once. The handle tables are the only shared
+ * mutable state and `tbl_lock` guards them; everything past a reserved
+ * handle is owned by one fiber.
+ *
  * The pump lives here, in C: the kaikai driver never sees a TLS record,
  * a WANT_READ, or the SSL_get_error switch — it only shuttles ciphertext.
  */
@@ -31,6 +36,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #define KAI_TLS_MAX_CONNS 128
 
@@ -84,27 +90,42 @@ typedef struct {
 
 static kai_tls_slot slots[KAI_TLS_MAX_CONNS];
 
+/* Guards the two handle tables and the lazy client ctx.
+ *
+ * kaikai runs fibers in parallel across OS threads (the default since
+ * 0.104), so two fibers CAN be inside this shim at the same instant.
+ * Only handle allocation needs the lock: once a slot is reserved it
+ * belongs to one fiber, and OpenSSL is thread-safe for distinct SSL
+ * objects over a shared, refcounted SSL_CTX. */
+static pthread_mutex_t tbl_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static SSL_CTX *client_ctx = NULL;
 
 static SSL_CTX *kai_tls_ctx(void) {
-  if (client_ctx != NULL) { return client_ctx; }
-  const SSL_METHOD *method = TLS_client_method();
-  if (method == NULL) { return NULL; }
-  SSL_CTX *ctx = SSL_CTX_new(method);
-  if (ctx == NULL) { return NULL; }
-  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-  SSL_CTX_set_default_verify_paths(ctx);
-  client_ctx = ctx;
-  return ctx;
+  pthread_mutex_lock(&tbl_lock);
+  if (client_ctx == NULL) {
+    const SSL_METHOD *method = TLS_client_method();
+    if (method != NULL) {
+      SSL_CTX *ctx = SSL_CTX_new(method);
+      if (ctx != NULL) {
+        SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+        SSL_CTX_set_default_verify_paths(ctx);
+        client_ctx = ctx;
+      }
+    }
+  }
+  SSL_CTX *out = client_ctx;
+  pthread_mutex_unlock(&tbl_lock);
+  return out;
 }
 
 /* ---- server listeners --------------------------------------------
  *
  * A listener owns a server SSL_CTX with the cert + key loaded ONCE, and
- * every accepted connection makes a fresh SSL over that shared ctx. The
- * ctx is shared across all accepted fibers without a lock: the scheduler
- * is a single OS thread (fibers, not threads), so two fibers are never
- * inside OpenSSL at the same instant. */
+ * every accepted connection makes a fresh SSL over that shared ctx.
+ * Sharing the ctx across accepted fibers needs no lock of its own:
+ * SSL_CTX is refcounted and internally synchronised, so SSL_new against
+ * it is safe from several threads at once. */
 
 #define KAI_TLS_MAX_LISTENERS 16
 
@@ -122,11 +143,30 @@ typedef struct {
 
 static kai_tls_listener listeners[KAI_TLS_MAX_LISTENERS];
 
+/* Reserve a listener slot. Marking `in_use` here, under the lock, is what
+ * makes the reservation atomic: the caller then builds the ctx at its
+ * leisure without a second thread handing out the same index. Every
+ * failure path after this must call listener_release. */
 static int listener_alloc(void) {
+  int found = -1;
+  pthread_mutex_lock(&tbl_lock);
   for (int i = 0; i < KAI_TLS_MAX_LISTENERS; i++) {
-    if (!listeners[i].in_use) { return i; }
+    if (!listeners[i].in_use) {
+      listeners[i].in_use = 1;
+      listeners[i].ctx    = NULL;
+      found = i;
+      break;
+    }
   }
-  return -1;
+  pthread_mutex_unlock(&tbl_lock);
+  return found;
+}
+
+static void listener_release(int idx) {
+  pthread_mutex_lock(&tbl_lock);
+  listeners[idx].ctx    = NULL;
+  listeners[idx].in_use = 0;
+  pthread_mutex_unlock(&tbl_lock);
 }
 
 static int listener_ok(int64_t s) {
@@ -143,19 +183,19 @@ static int64_t listener_new(const char *cert_file, const char *key_file,
   if (idx < 0) { return KAI_TLS_ERR_LISTENER_FULL; }
 
   const SSL_METHOD *method = TLS_server_method();
-  if (method == NULL) { return KAI_TLS_ERR_CTX; }
+  if (method == NULL) { listener_release(idx); return KAI_TLS_ERR_CTX; }
   SSL_CTX *ctx = SSL_CTX_new(method);
-  if (ctx == NULL) { return KAI_TLS_ERR_CTX; }
+  if (ctx == NULL) { listener_release(idx); return KAI_TLS_ERR_CTX; }
   SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
 
   if (SSL_CTX_use_certificate_chain_file(ctx, cert_file) != 1) {
-    SSL_CTX_free(ctx); return KAI_TLS_ERR_CERT;
+    SSL_CTX_free(ctx); listener_release(idx); return KAI_TLS_ERR_CERT;
   }
   if (SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) != 1) {
-    SSL_CTX_free(ctx); return KAI_TLS_ERR_KEY;
+    SSL_CTX_free(ctx); listener_release(idx); return KAI_TLS_ERR_KEY;
   }
   if (SSL_CTX_check_private_key(ctx) != 1) {
-    SSL_CTX_free(ctx); return KAI_TLS_ERR_KEY;
+    SSL_CTX_free(ctx); listener_release(idx); return KAI_TLS_ERR_KEY;
   }
 
   if (ca_file != NULL) {
@@ -167,7 +207,7 @@ static int64_t listener_new(const char *cert_file, const char *key_file,
      * 1 would silently admit invalid certs — the rejection depends on
      * this default. */
     if (SSL_CTX_load_verify_file(ctx, ca_file) != 1) {
-      SSL_CTX_free(ctx); return KAI_TLS_ERR_CA;
+      SSL_CTX_free(ctx); listener_release(idx); return KAI_TLS_ERR_CA;
     }
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
   }
@@ -194,15 +234,42 @@ void kai_tls_listener_free(int64_t listener) {
   if (!listener_ok(listener)) { return; }
   int i = (int)listener;
   SSL_CTX_free(listeners[i].ctx);
-  listeners[i].ctx    = NULL;
-  listeners[i].in_use = 0;
+  listener_release(i);
 }
 
+/* Reserve a connection slot. Same contract as listener_alloc: `in_use` is
+ * set here, under the lock, so the index is nobody else's before the
+ * caller gets around to wiring an SSL into it. The fields are cleared so
+ * a reserved-but-unwired slot released on an error path leaves nothing
+ * behind. Every failure path after this must call slot_release. */
 static int slot_alloc(void) {
+  int found = -1;
+  pthread_mutex_lock(&tbl_lock);
   for (int i = 0; i < KAI_TLS_MAX_CONNS; i++) {
-    if (!slots[i].in_use) { return i; }
+    if (!slots[i].in_use) {
+      slots[i].in_use = 1;
+      slots[i].ssl    = NULL;
+      slots[i].rbio   = NULL;
+      slots[i].wbio   = NULL;
+      slots[i].hexbuf = NULL;
+      slots[i].hexcap = 0;
+      found = i;
+      break;
+    }
   }
-  return -1;
+  pthread_mutex_unlock(&tbl_lock);
+  return found;
+}
+
+static void slot_release(int idx) {
+  pthread_mutex_lock(&tbl_lock);
+  slots[idx].ssl    = NULL;
+  slots[idx].rbio   = NULL;
+  slots[idx].wbio   = NULL;
+  slots[idx].hexbuf = NULL;
+  slots[idx].hexcap = 0;
+  slots[idx].in_use = 0;
+  pthread_mutex_unlock(&tbl_lock);
 }
 
 static int slot_ok(int64_t s) {
@@ -252,10 +319,10 @@ static int wire_slot(int idx, SSL *ssl) {
     return KAI_TLS_ERR_SSL;
   }
   SSL_set_bio(ssl, rbio, wbio);   /* SSL_free will free both BIOs */
+  /* `in_use` was already set by slot_alloc — the slot is ours. */
   slots[idx].ssl    = ssl;
   slots[idx].rbio   = rbio;
   slots[idx].wbio   = wbio;
-  slots[idx].in_use = 1;
   slots[idx].hexbuf = NULL;
   slots[idx].hexcap = 0;
   return 0;
@@ -276,20 +343,20 @@ static int64_t client_new(const char *host, int insecure,
   if (idx < 0) { return KAI_TLS_ERR_SLOT; }
 
   SSL_CTX *ctx = kai_tls_ctx();
-  if (ctx == NULL) { return KAI_TLS_ERR_SSL; }
+  if (ctx == NULL) { slot_release(idx); return KAI_TLS_ERR_SSL; }
 
   SSL *ssl = SSL_new(ctx);
-  if (ssl == NULL) { return KAI_TLS_ERR_SSL; }
+  if (ssl == NULL) { slot_release(idx); return KAI_TLS_ERR_SSL; }
 
   if (cert_file != NULL) {
     if (SSL_use_certificate_chain_file(ssl, cert_file) != 1) {
-      SSL_free(ssl); return KAI_TLS_ERR_CERT;
+      SSL_free(ssl); slot_release(idx); return KAI_TLS_ERR_CERT;
     }
     if (SSL_use_PrivateKey_file(ssl, key_file, SSL_FILETYPE_PEM) != 1) {
-      SSL_free(ssl); return KAI_TLS_ERR_KEY;
+      SSL_free(ssl); slot_release(idx); return KAI_TLS_ERR_KEY;
     }
     if (SSL_check_private_key(ssl) != 1) {
-      SSL_free(ssl); return KAI_TLS_ERR_KEY;
+      SSL_free(ssl); slot_release(idx); return KAI_TLS_ERR_KEY;
     }
   }
 
@@ -297,9 +364,9 @@ static int64_t client_new(const char *host, int insecure,
     /* Trust exactly this CA for the server chain, per-connection. The
      * store's refcount is bumped by set1, so we drop our reference after. */
     X509_STORE *store = X509_STORE_new();
-    if (store == NULL) { SSL_free(ssl); return KAI_TLS_ERR_CTX; }
+    if (store == NULL) { SSL_free(ssl); slot_release(idx); return KAI_TLS_ERR_CTX; }
     if (X509_STORE_load_file(store, ca_file) != 1) {
-      X509_STORE_free(store); SSL_free(ssl); return KAI_TLS_ERR_CA;
+      X509_STORE_free(store); SSL_free(ssl); slot_release(idx); return KAI_TLS_ERR_CA;
     }
     SSL_set1_verify_cert_store(ssl, store);
     X509_STORE_free(store);
@@ -307,7 +374,9 @@ static int64_t client_new(const char *host, int insecure,
 
   if (!insecure) {
     SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    if (kai_tls_set_verify_name(ssl, host) != 1) { SSL_free(ssl); return KAI_TLS_ERR_SSL; }
+    if (kai_tls_set_verify_name(ssl, host) != 1) {
+      SSL_free(ssl); slot_release(idx); return KAI_TLS_ERR_SSL;
+    }
     /* Callback MUST stay NULL: OpenSSL's default fails the handshake on a
      * bad chain / hostname / expiry. A callback returning 1 would defeat
      * verification silently — the security of connect() rests on it. */
@@ -318,7 +387,7 @@ static int64_t client_new(const char *host, int insecure,
   if (!host_is_ip(host)) { SSL_set_tlsext_host_name(ssl, host); }
 
   int rc = wire_slot(idx, ssl);
-  if (rc != 0) { return rc; }
+  if (rc != 0) { slot_release(idx); return rc; }
   SSL_set_connect_state(slots[idx].ssl);   /* we are the client */
   return (int64_t)idx;
 }
@@ -359,10 +428,10 @@ int64_t kai_tls_accept(int64_t listener) {
   if (idx < 0) { return KAI_TLS_ERR_SLOT; }
 
   SSL *ssl = SSL_new(listeners[(int)listener].ctx);
-  if (ssl == NULL) { return KAI_TLS_ERR_SSL; }
+  if (ssl == NULL) { slot_release(idx); return KAI_TLS_ERR_SSL; }
 
   int rc = wire_slot(idx, ssl);
-  if (rc != 0) { return rc; }
+  if (rc != 0) { slot_release(idx); return rc; }
   SSL_set_accept_state(slots[idx].ssl);    /* we are the server */
   return (int64_t)idx;
 }
@@ -376,12 +445,9 @@ void kai_tls_free(int64_t slot) {
   SSL_free(slots[i].ssl);       /* frees rbio + wbio too */
   free(slots[i].hexbuf);
   ERR_clear_error();
-  slots[i].ssl    = NULL;
-  slots[i].rbio   = NULL;
-  slots[i].wbio   = NULL;
-  slots[i].hexbuf = NULL;
-  slots[i].hexcap = 0;
-  slots[i].in_use = 0;
+  /* Clearing `in_use` under the lock is what publishes the slot back to
+   * the allocator, so another thread cannot pick it up mid-teardown. */
+  slot_release(i);
 }
 
 /* ---- ciphertext transport (driver <-> BIOs) ----------------------- */
