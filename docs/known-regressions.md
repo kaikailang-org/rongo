@@ -60,15 +60,24 @@ second passed its own suite untouched — `tests/test_https_url.kai`
 covers URL parsing, not response framing — and only showed up as a
 deadlock in `examples/http_server`.
 
-**Workaround applied.** Both predicates now read `string_length` of
-the subject and the separator *before* handing either to `find`, and
-use the saved values afterwards. This restores correct behaviour on
-0.123.0 and is harmless on a fixed compiler, but it is load-bearing
-statement order: do not reorder those `let`s, and prefer reading a
-string's length before passing it on anywhere in this package until
-the upstream fix lands.
+**Workaround, since removed.** Both predicates read `string_length`
+of the subject and the separator *before* handing either to `find`,
+and used the saved values afterwards. That restored correct behaviour
+on 0.123.0 at the cost of load-bearing statement order. It was
+reverted once the fix shipped; the sources read in their natural
+order again.
 
-**Blocks the suite.** No, not any more — `make test` passes 25/25 and
-`examples/http_server` completes its keep-alive + crash-isolation
-roundtrip with the workaround in place. Without it, 1 test fails and
-both the server and client lanes deadlock at runtime.
+**Status.** Resolved upstream in kaikai 0.124.0 by
+[lnds/kaikai#2099](https://github.com/lnds/kaikai/pull/2099), *fix
+(perceus): resolve a bare callee's borrow convention per calling
+module*, filed from here as
+[lnds/kaikai#2095](https://github.com/lnds/kaikai/issues/2095).
+Verified on the released binaries with one clean build each: the
+reproduction above aborts on 0.123.0 and prints `len=4` on both
+0.124.0 and 0.124.1. With the workaround reverted, `make test` passes
+25/25 and `examples/http_server` completes its keep-alive +
+crash-isolation roundtrip on 0.124.1.
+
+Nothing in this package works around it any more, so **0.124.0 is the
+floor**: on 0.123.0 both the server and the client lanes deadlock at
+runtime.
