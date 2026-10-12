@@ -117,7 +117,7 @@ See `examples/` for runnable versions (`https_get`, `https_post`,
 
 ## Build
 
-The kaikai bindings link against the `ffi/tls_openssl.c` OpenSSL shim,
+The kaikai bindings link against the `rongo/ffi/tls_openssl.c` OpenSSL shim,
 which needs OpenSSL's headers and libraries. Rongo declares the shim plus
 `ssl` and `crypto` in its `[native]` package contract, so they propagate to
 consumers automatically. The Makefile uses `pkg-config` only to locate system
