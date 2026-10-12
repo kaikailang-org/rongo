@@ -1,5 +1,5 @@
 # rongo — TLS lane over OpenSSL. The kaikai bindings link against the
-# `ffi/tls_openssl.c` slot-table shim, which needs OpenSSL's headers and
+# `rongo/ffi/tls_openssl.c` slot-table shim, which needs OpenSSL's headers and
 # libs. kai.toml carries the shim and link libraries transitively; CFLAGS
 # only supplies keg-specific include/library search paths from pkg-config.
 #
@@ -29,9 +29,13 @@ endif
 
 OPENSSL_CFLAGS  := $(shell $(PKG_ENV) pkg-config --cflags openssl)
 OPENSSL_LDFLAGS := $(shell $(PKG_ENV) pkg-config --libs-only-L openssl)
-SHIM := ffi/tls_openssl.c
+SHIM := rongo/ffi/tls_openssl.c
 
-KAI_CFLAGS := -std=c99 -O2 -Wall $(OPENSSL_CFLAGS) $(OPENSSL_LDFLAGS)
+# The driver hands one flag set to both the compile and the link step,
+# so the library search path goes unused while compiling. That is not a
+# finding, and it is reported once per translation unit, so it is off.
+KAI_CFLAGS := -std=c99 -O2 -Wall -Wno-unused-command-line-argument \
+                $(OPENSSL_CFLAGS) $(OPENSSL_LDFLAGS)
 
 .PHONY: all demo test example example-post example-concurrent example-keepalive \
         example-pool example-server example-mtls example-http-server \
@@ -79,7 +83,7 @@ test-certs/client.crt: test-certs/ca.crt
 # The entry-point demo (rongo.kai) — a live https.get.
 demo: build/rongo
 
-build/rongo: rongo.kai https.kai tls.kai ffi/tls.kai $(SHIM) | build
+build/rongo: rongo.kai rongo/https.kai rongo/tls.kai rongo/ffi/tls.kai $(SHIM) | build
 	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) build . -o $@
 
 # Examples live under examples/ but build as part of the rongo package so
@@ -90,7 +94,7 @@ build/rongo: rongo.kai https.kai tls.kai ffi/tls.kai $(SHIM) | build
 # the manifest for the build and restores it after.
 #
 # build_example: $1 = entry .kai path, $2 = output binary.
-LIB_SRCS := https.kai http_server.kai pool.kai tls.kai ffi/tls.kai $(SHIM)
+LIB_SRCS := rongo/https.kai rongo/http_server.kai rongo/pool.kai rongo/tls.kai rongo/ffi/tls.kai $(SHIM)
 
 define build_example
 	cp kai.toml kai.toml.bak
@@ -138,7 +142,7 @@ build/mtls: examples/mtls/main.kai $(LIB_SRCS) | build
 # The 0.5.0 gate: an HTTPS server (serve + handler) and rongo's own client
 # over one keep-alive connection, both in one process. Needs `make certs`.
 example-http-server: build/http_server
-build/http_server: examples/http_server/main.kai $(LIB_SRCS) http_server.kai | build
+build/http_server: examples/http_server/main.kai $(LIB_SRCS) | build
 	$(call build_example,examples/http_server/main.kai,$@)
 
 # Package tests: pure parsers + the effect mock (no network) run under
