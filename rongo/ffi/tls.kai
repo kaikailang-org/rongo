@@ -16,6 +16,8 @@ plaintext in as String+len, out as hex.
 
 import net.tcp
 
+import rongo.ffi.tls_proto
+
 import net.http
 
 import encoding.hex
@@ -69,15 +71,6 @@ extern "C"("kai_tls_listener_free") fn raw_listener_free(listener: Int) : Unit /
 
 extern "C"("kai_tls_accept") fn raw_accept(listener: Int) : Int / Ffi
 
-# Shim status codes (mirror the #defines in ffi/tls_openssl.c).
-const TLS_OK : Int = 0
-
-const TLS_WANT_READ : Int = 1
-
-const TLS_WANT_WRITE : Int = 2
-
-const TLS_ERR_VERIFY : Int = 0 - 3
-
 # ---- ciphertext shuttle -------------------------------------------
 
 # Drain all pending outgoing ciphertext from the shim's write-BIO and
@@ -122,20 +115,15 @@ fn handshake(c: tcp.Conn, slot: Int) : Result[Unit, String] / NetTcp + Ffi {
   let st = raw_step(slot)
   match drain_outgoing(c, slot) {
     Err(e) -> Err(e)
-    Ok(_) -> if st == TLS_OK {
-      Ok(())
-    } else if st == TLS_ERR_VERIFY {
-      Err("tls: certificate verification failed")
-    } else if st < 0 {
-      Err("tls: handshake failed")
-    } else if st == TLS_WANT_READ {
-      match feed_incoming(c, slot) {
+    Ok(_) -> match tls_proto.step_of(st) {
+      tls_proto.Done -> Ok(())
+      tls_proto.Failed(e) -> Err(e)
+      tls_proto.NeedRead -> match feed_incoming(c, slot) {
         Err(e) -> Err(e)
         Ok(false) -> Err("tls: peer closed during handshake")
         Ok(true) -> handshake(c, slot)
       }
-    } else {
-      handshake(c, slot)  # WANT_WRITE: drained, loop
+      tls_proto.Retry -> handshake(c, slot)
     }
   }
 }
@@ -146,7 +134,7 @@ fn handshake(c: tcp.Conn, slot: Int) : Result[Unit, String] / NetTcp + Ffi {
 # created by one of the raw_new variants), and pair them into a TlsConn.
 # A slot < 0 means the SSL setup failed (bad client cert, etc).
 fn connect_over(host: String, port: Int, slot: Int) : Result[TlsConn, String] / NetTcp + Ffi = if slot < 0 {
-  Err(connect_error(slot))
+  Err(tls_proto.connect_error(slot))
 } else {
   match NetTcp.connect(host, port) {
     Err(e) -> {
@@ -162,13 +150,6 @@ fn connect_over(host: String, port: Int, slot: Int) : Result[TlsConn, String] / 
       Ok(_) -> Ok(TlsConn { conn: c, slot: slot })
     }
   }
-}
-
-fn connect_error(code: Int) : String = match code {
-  -12 -> "tls: client certificate load failed"
-  -13 -> "tls: client private key load failed or mismatched"
-  -14 -> "tls: CA file load failed"
-  _ -> "tls: SSL init failed"
 }
 
 #[doc("""
@@ -240,30 +221,15 @@ Receive up to `max` decrypted bytes. `Ok([])` at clean end of stream.
 On the shim's WANT_READ, pulls more ciphertext from NetTcp and retries.
 """)]
 pub fn recv(c: TlsConn, max: Int) : Result[[Int], String] / NetTcp + Ffi {
-  let frame = raw_read(c.slot, max)
-  match char_at(frame, 0) {
-    None -> Ok([])
-    Some('e') -> Ok([])
-    Some(
-    # clean EOF
-    'x') -> Err("tls: decrypt failed")
-    Some('r') -> 
-    # WANT_READ: feed ciphertext, retry
-    match feed_incoming(c.conn, c.slot) {
+  match tls_proto.frame_of(raw_read(c.slot, max)) {
+    tls_proto.End -> Ok([])
+    tls_proto.Data(bs) -> Ok(bs)
+    tls_proto.Broken(e) -> Err(e)
+    tls_proto.WantRead -> match feed_incoming(c.conn, c.slot) {
       Err(e) -> Err(e)
-      Ok(false) -> Ok([])
-      Ok(
-      # peer closed with no more data
-      true) -> recv(c, max)
+      Ok(false) -> Ok([])  # peer closed with no more data
+      Ok(true) -> recv(c, max)
     }
-    Some('d') -> {
-      let body = string_slice(frame, 1, string_length(frame) - 1)
-      match hex.decode(body) {
-        Some(bs) -> Ok(bs)
-        None -> Err("tls: malformed decrypt frame")
-      }
-    }
-    Some(_) -> Err("tls: malformed decrypt frame")
   }
 }
 
@@ -294,17 +260,8 @@ A TLS server listener: a bound TCP port plus the server certificate.
 """)]
 pub type TlsListener = { priv tcp_l: tcp.Listener, priv slot: Int }
 
-fn listener_error(code: Int) : String = match code {
-  -10 -> "tls: listener table full"
-  -11 -> "tls: server context allocation failed"
-  -12 -> "tls: server certificate load failed"
-  -13 -> "tls: private key load failed or mismatched"
-  -14 -> "tls: client-CA file load failed (mTLS)"
-  _ -> "tls: listener error (code #{int_to_string(code)})"
-}
-
 fn listen_impl(host: String, port: Int, lslot: Int) : Result[TlsListener, String] / NetTcp + Ffi = if lslot < 0 {
-  Err(listener_error(lslot))
+  Err(tls_proto.listener_error(lslot))
 } else {
   match NetTcp.listen(host, port) {
     Err(e) -> {

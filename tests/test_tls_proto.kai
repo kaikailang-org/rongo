@@ -1,0 +1,166 @@
+# The shim's answers, decoded — no socket, no OpenSSL, no FFI. These are
+# the decisions the TLS driver makes on every handshake step and every
+# read, and they are the only part of the driver a test can reach: the
+# test runner installs no Ffi capability, so anything that calls the shim
+# is out of reach by construction.
+#
+# Every status code and every frame tag the shim can emit is covered
+# here, including the ones that mean "this cannot have come from the
+# shim", because that is the arm a malformed frame lands in.
+
+import rongo.ffi.tls_proto
+
+# Name each outcome as a number, so a test can assert on one value and
+# the failure message says which arm was taken instead of just `false`.
+fn step_tag(s: tls_proto.Step) : Int = match s {
+  tls_proto.Done -> 0
+  tls_proto.NeedRead -> 1
+  tls_proto.Retry -> 2
+  tls_proto.Failed(_) -> 3
+}
+
+fn step_message(s: tls_proto.Step) : String = match s {
+  tls_proto.Failed(e) -> e
+  _ -> ""
+}
+
+fn frame_tag(f: tls_proto.Frame) : Int = match f {
+  tls_proto.End -> 0
+  tls_proto.WantRead -> 1
+  tls_proto.Data(_) -> 2
+  tls_proto.Broken(_) -> 3
+}
+
+fn frame_bytes(f: tls_proto.Frame) : [Int] = match f {
+  tls_proto.Data(bs) -> bs
+  _ -> []
+}
+
+fn frame_message(f: tls_proto.Frame) : String = match f {
+  tls_proto.Broken(e) -> e
+  _ -> ""
+}
+
+# ---- step_of ------------------------------------------------------
+
+test "step_of — 0 is a completed op" {
+  assert step_tag(tls_proto.step_of(0)) == 0
+}
+
+test "step_of — want-read asks for ciphertext" {
+  assert step_tag(tls_proto.step_of(1)) == 1
+}
+
+test "step_of — want-write only needs another pump" {
+  # The driver drains the write BIO before it ever looks at the code, so
+  # by this point WANT_WRITE has nothing left to ask for.
+  assert step_tag(tls_proto.step_of(2)) == 2
+}
+
+test "step_of — an unknown non-negative code is progress, not failure" {
+  # Non-negative means the shim made progress. A code this driver does
+  # not know must not be read as an error: pumping again is safe, and
+  # failing would turn a shim addition into a broken connection.
+  assert step_tag(tls_proto.step_of(7)) == 2
+}
+
+test "step_of — verification failure is named" {
+  # The one failure a caller can act on: fix the trust root or the
+  # hostname. Retrying it will never help.
+  let s = tls_proto.step_of(0 - 3)
+  assert step_tag(s) == 3
+  assert step_message(s) == "tls: certificate verification failed"
+}
+
+test "step_of — every other negative code is a fatal TLS error" {
+  assert step_message(tls_proto.step_of(0 - 1)) == "tls: handshake failed"
+  assert step_message(tls_proto.step_of(0 - 2)) == "tls: handshake failed"
+  assert step_message(tls_proto.step_of(0 - 99)) == "tls: handshake failed"
+}
+
+# ---- frame_of -----------------------------------------------------
+
+test "frame_of — an empty frame is the end of the stream" {
+  # The shim returns no tag when it has nothing to report, and the
+  # driver must treat that as a clean close, not as a malformed frame.
+  assert frame_tag(tls_proto.frame_of("")) == 0
+}
+
+test "frame_of — e is the end of the stream" {
+  assert frame_tag(tls_proto.frame_of("e")) == 0
+}
+
+test "frame_of — r asks for more ciphertext" {
+  assert frame_tag(tls_proto.frame_of("r")) == 1
+}
+
+test "frame_of — x is a decrypt failure" {
+  let f = tls_proto.frame_of("x")
+  assert frame_tag(f) == 3
+  assert frame_message(f) == "tls: decrypt failed"
+}
+
+test "frame_of — d carries the plaintext as hex" {
+  let f = tls_proto.frame_of("d6869")
+  assert frame_tag(f) == 2
+  assert frame_bytes(f) == [104, 105]  # "hi"
+}
+
+test "frame_of — a d frame with no payload decodes to no bytes" {
+  # Distinct from the empty frame: the shim tagged a data frame, so the
+  # answer is zero bytes of data, not the end of the stream.
+  let f = tls_proto.frame_of("d")
+  assert frame_tag(f) == 2
+  assert list_length(frame_bytes(f)) == 0
+}
+
+test "frame_of — a d frame whose payload is not hex is malformed" {
+  let f = tls_proto.frame_of("dzz")
+  assert frame_tag(f) == 3
+  assert frame_message(f) == "tls: malformed decrypt frame"
+}
+
+test "frame_of — an odd number of hex digits is malformed" {
+  # Hex comes in pairs; a dangling digit is a truncated frame, which
+  # must not decode to a byte the shim never sent.
+  assert frame_message(tls_proto.frame_of("d686")) == "tls: malformed decrypt frame"
+}
+
+test "frame_of — a tag this driver did not write is malformed" {
+  assert frame_message(tls_proto.frame_of("q")) == "tls: malformed decrypt frame"
+}
+
+# ---- constructor error codes --------------------------------------
+
+test "connect_error — the three codes the caller gave material for" {
+  assert tls_proto.connect_error(0 - 12) == "tls: client certificate load failed"
+  assert tls_proto.connect_error(0 - 13) == "tls: client private key load failed or mismatched"
+  assert tls_proto.connect_error(0 - 14) == "tls: CA file load failed"
+}
+
+test "connect_error — anything else has nothing actionable in it" {
+  assert tls_proto.connect_error(0 - 1) == "tls: SSL init failed"
+  assert tls_proto.connect_error(0 - 11) == "tls: SSL init failed"
+}
+
+test "listener_error — the server-side codes a client does not have" {
+  assert tls_proto.listener_error(0 - 10) == "tls: listener table full"
+  assert tls_proto.listener_error(0 - 11) == "tls: server context allocation failed"
+}
+
+test "listener_error — the server's own cert and key failures" {
+  # Same numbers as the client's, different wording: on this side the
+  # cert being loaded is the server's.
+  assert tls_proto.listener_error(0 - 12) == "tls: server certificate load failed"
+  assert tls_proto.listener_error(0 - 13) == "tls: private key load failed or mismatched"
+  assert tls_proto.listener_error(0 - 14) == "tls: client-CA file load failed (mTLS)"
+}
+
+test "listener_error — an unknown code is reported with its number" {
+  # A listener is set up once at startup, where the number is worth
+  # seeing; a connection error is not, which is why only this side
+  # carries it.
+  assert tls_proto.listener_error(0 - 77) == "tls: listener error (code -77)"
+}
+
+fn main() : Int = 0
