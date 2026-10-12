@@ -1,0 +1,116 @@
+#[doc("""
+The C shim's answers, decoded. `import rongo.ffi.tls_proto`.
+
+`rongo.ffi.tls` shuttles ciphertext between OpenSSL's memory BIOs and
+`NetTcp`, and every decision it makes is driven by one of three answers
+the shim gives: a status code from a pump op, a framed read result, or
+a negative code from a constructor. Deciding what each one means is
+pure — no socket, no OpenSSL, no `Ffi` — so it lives here, apart from
+the transport it drives.
+
+The encodings mirror `ffi/tls_openssl.c`: non-negative status codes are
+progress, negative ones are failures, and a read frame is a one-char
+tag optionally followed by hex.
+""")]
+
+import encoding.hex
+
+# Pump status codes, mirroring the KAI_TLS_* #defines in the shim.
+const OK : Int = 0
+
+const WANT_READ : Int = 1
+
+const ERR_VERIFY : Int = 0 - 3
+
+#[doc("""
+What a pump op's status code asks the driver to do next.
+
+`Retry` covers `WANT_WRITE` and any other non-negative code: the
+ciphertext the op produced has already been drained by the time the
+driver acts on this, so the only thing left is to pump again.
+""")]
+pub type Step
+  = Done
+  | NeedRead
+  | Retry
+  | Failed(String)
+
+#[doc("""
+Decode a pump status code (`kai_tls_step`, `kai_tls_write`).
+
+Verification failure is the one error worth naming: it is the error a
+caller can act on, by fixing a trust root or a hostname rather than
+retrying. Every other negative code is a fatal TLS error the caller
+cannot distinguish or repair.
+""")]
+pub fn step_of(code: Int) : Step = if code == OK {
+  Done
+} else if code == ERR_VERIFY {
+  Failed("tls: certificate verification failed")
+} else if code < OK {
+  Failed("tls: handshake failed")
+} else if code == WANT_READ {
+  NeedRead
+} else {
+  Retry
+}
+
+#[doc("""
+What one read frame carries.
+
+`End` is a clean end of stream, which is also what an empty frame
+means: the shim returns no tag when there is nothing to report.
+""")]
+pub type Frame
+  = End
+  | WantRead
+  | Data([Int])
+  | Broken(String)
+
+#[doc("""
+Decode a read frame (`kai_tls_read`): `""` or `"e"` for end of stream,
+`"r"` for want-read, `"x"` for a decrypt error, `"d"` followed by the
+plaintext in hex. Anything else is a frame this driver did not write.
+""")]
+pub fn frame_of(frame: String) : Frame = match char_at(frame, 0) {
+  None -> End
+  Some('e') -> End
+  Some('r') -> WantRead
+  Some('x') -> Broken("tls: decrypt failed")
+  Some('d') -> match hex.decode(string_slice(frame, 1, string_length(frame) - 1)) {
+    Some(bs) -> Data(bs)
+    None -> Broken("tls: malformed decrypt frame")
+  }
+  Some(_) -> Broken("tls: malformed decrypt frame")
+}
+
+#[doc("""
+Name the failure behind a negative code from a client-side constructor
+(`kai_tls_new` and its cert / CA variants).
+
+The three named codes are the ones the caller gave material for and can
+therefore fix. Anything else is an allocation or context failure with
+nothing actionable in it.
+""")]
+pub fn connect_error(code: Int) : String = match code {
+  -12 -> "tls: client certificate load failed"
+  -13 -> "tls: client private key load failed or mismatched"
+  -14 -> "tls: CA file load failed"
+  _ -> "tls: SSL init failed"
+}
+
+#[doc("""
+Name the failure behind a negative code from `kai_tls_listener_new` or
+its mTLS variant. A listener has two failures a client does not — the
+table is full, or the server context would not allocate — and the
+unknown case carries the code, because a listener is set up once at
+startup where the number is worth seeing.
+""")]
+pub fn listener_error(code: Int) : String = match code {
+  -10 -> "tls: listener table full"
+  -11 -> "tls: server context allocation failed"
+  -12 -> "tls: server certificate load failed"
+  -13 -> "tls: private key load failed or mismatched"
+  -14 -> "tls: client-CA file load failed (mTLS)"
+  _ -> "tls: listener error (code #{int_to_string(code)})"
+}
