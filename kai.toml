@@ -6,5 +6,5 @@ version = "0.8.0"
 entry = "rongo.kai"
 
 [native]
-sources = ["ffi/tls_openssl.c"]
+sources = ["rongo/ffi/tls_openssl.c"]
 libs = ["ssl", "crypto"]
