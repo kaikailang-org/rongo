@@ -1,3 +1,17 @@
+## v0.9.0 (2026-10-12)
+
+### BREAKING CHANGE
+
+- reaching into the package root as `import ffi.tls`
+no longer resolves. The public path for that module is
+`rongo.ffi.tls`, as the entry point's documentation has it; the
+in-tree consumer fixture was the only place using the short form.
+
+### Refactor
+
+- **tls**: decode the shim's answers in a module without Ffi
+- move the library modules into the package directory
+
 ## v0.8.0 (2026-09-24)
 
 ### Fix
