@@ -165,7 +165,8 @@ CFLAGS="$(pkg-config --cflags openssl) $(pkg-config --libs-only-L openssl)" kai 
 Requires kaikai 0.124.0 or newer. Transitive `[native]` dependencies
 need 0.112.0, but the HTTP framing predicates hit a reference-counting
 bug present through 0.123.0 that deadlocks both the server and the
-client lane at runtime — see `docs/known-regressions.md`.
+client lane at runtime — see `docs/known-regressions.md`. Verified
+against 0.174.0.
 
 ## Install
 
