@@ -89,7 +89,11 @@ fn read_request(c: tls.TlsConn, cfg: Config) : ReadResult / NetTcp + Ffi = read_
 
 fn read_request_loop(c: tls.TlsConn, cfg: Config, acc_rev: [Int], have: Int) : ReadResult / NetTcp + Ffi {
   let raw = http.bytes_to_string(list_reverse(acc_rev))
-  if request_complete(raw) {
+  # The cap is checked first, so a request over it is refused however
+  # its bytes happened to be split across reads.
+  if have > cfg.max_request_bytes {
+    ReadError("request exceeds max_request_bytes")
+  } else if request_complete(raw) {
     let head_end = find(raw, "\r\n\r\n")
     let head = if head_end < 0 {
       raw
@@ -104,8 +108,6 @@ fn read_request_loop(c: tls.TlsConn, cfg: Config, acc_rev: [Int], have: Int) : R
         Err(e) -> ReadError(e)
       }
     }
-  } else if have > cfg.max_request_bytes {
-    ReadError("request exceeds max_request_bytes")
   } else {
     match tls.recv(c, 4096) {
       Err(e) -> ReadError(e)

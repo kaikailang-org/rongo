@@ -33,4 +33,50 @@ test "a plain request is not chunked" {
   assert not http_server.is_chunked("POST /x HTTP/1.1\r\nContent-Length: 3")
 }
 
+test "a chunked request is complete at the blank line, before its body" {
+  # The read loop stops here so the server can refuse it with a 411.
+  assert http_server.request_complete("POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+  assert http_server.request_complete("POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 9\r\n\r\n")
+}
+
+test "a bare blank line is a complete request" {
+  # Complete, not valid: it is the parser's job to refuse it.
+  assert http_server.request_complete("\r\n\r\n")
+}
+
+test "framing headers count on any line of the head" {
+  assert not http_server.request_complete("Content-Length: 5\r\n\r\nhi")
+  assert http_server.request_complete("Transfer-Encoding: chunked\r\n\r\n")
+}
+
+test "Content-Length matches in any case and ignores surrounding whitespace" {
+  assert not http_server.request_complete("POST /x HTTP/1.1\r\nCONTENT-LENGTH: 5\r\n\r\nhi")
+  assert not http_server.request_complete("POST /x HTTP/1.1\r\ncontent-length:5\r\n\r\nhi")
+  assert not http_server.request_complete("POST /x HTTP/1.1\r\nContent-Length: 5 \r\n\r\nhi")
+  assert not http_server.request_complete("POST /x HTTP/1.1\r\nContent-Length:\t5\t\r\n\r\nhi")
+  assert http_server.request_complete("POST /x HTTP/1.1\r\nContent-Length: 2 \r\n\r\nhi")
+}
+
+test "an unreadable Content-Length frames no body" {
+  assert http_server.request_complete("POST /x HTTP/1.1\r\nContent-Length: five\r\n\r\n")
+}
+
+test "chunked detection ignores whitespace and letter case" {
+  assert http_server.is_chunked("POST /x HTTP/1.1\r\nTransfer-Encoding:chunked")
+  assert http_server.is_chunked("POST /x HTTP/1.1\r\nTRANSFER-ENCODING: gzip, chunked")
+  assert not http_server.is_chunked("POST /x HTTP/1.1\r\nTransfer-Encoding: gzip")
+}
+
+test "only the Transfer-Encoding header can make a request chunked" {
+  assert not http_server.is_chunked("POST /chunked HTTP/1.1\r\nX-Note: chunked")
+  assert not http_server.is_chunked("POST /x HTTP/1.1\r\nchunked")
+}
+
+test "default_config: 1 MiB per request, 64 connections, keep-alive on" {
+  let cfg = http_server.default_config()
+  assert cfg.max_request_bytes == 1048576
+  assert cfg.max_connections == 64
+  assert cfg.keep_alive
+}
+
 fn main() : Int = 0
