@@ -314,6 +314,12 @@ pub fn accept(l: TlsListener) : Result[TlsConn, String] / NetTcp + Ffi = match N
 }
 
 #[doc("""
+The TCP port `l` is bound to — the one the kernel picked when `listen`
+was asked for port 0.
+""")]
+pub fn local_port(l: TlsListener) : Int = tcp.local_port(l.tcp_l)
+
+#[doc("""
 Release a listener's server context. Accepted connections are
 independent and unaffected. The bound TCP port itself is held by the
 runtime's `NetTcp` listener, which exposes no explicit close in v1 — it
