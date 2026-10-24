@@ -1,3 +1,20 @@
+## v0.10.0 (2026-10-24)
+
+### Feat
+
+- **tls**: expose the port a listener is bound to
+- **https**: expose response_complete
+
+### Fix
+
+- **http_server**: refuse a request over max_request_bytes however it arrives
+- **http_server**: honour Connection: close in any letter case
+- **https**: reject a URL whose port is not a TCP port number
+
+### Refactor
+
+- **https**: drop a trim the header parser has already applied
+
 ## v0.9.0 (2026-10-12)
 
 ### BREAKING CHANGE
