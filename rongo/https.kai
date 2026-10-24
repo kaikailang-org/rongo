@@ -210,7 +210,7 @@ fn response_complete(raw: String, method: String) : Bool {
           false
         }
         None -> match header_ci(hdrs, "content-length") {
-          Some(v) -> match string_to_int(trim(v)) {
+          Some(v) -> match string_to_int(v) {
             Some(n) -> body_len >= n
             None -> false
           }
