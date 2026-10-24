@@ -110,12 +110,6 @@ non-blocking transport (0.2.0) and the pool (0.6.0).
 
 ## Standing debt (not a feature, but tracked)
 
-- **No automated test of the real OpenSSL path.** kaikai's test runner
-  installs no `Ffi` capability, so `kai test` can only cover the pure
-  parser and the effect mock. The live path (handshake, verify, the pump,
-  keep-alive framing) is covered only by the runnable examples, gated in
-  CI. If a way to drive FFI under `kai test` appears upstream, move that
-  coverage into real tests.
 - **Chunked trailers are framed but not exposed.** `chunked_complete`
   waits for the final CRLF after the terminating chunk (so trailers don't
   corrupt the next keep-alive request), but the trailer headers

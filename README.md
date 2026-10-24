@@ -134,14 +134,17 @@ make certs              # dev CA + server/client certs for the TLS examples
 make example-server     # examples/tls_echo          (TLS server + client, one process)
 make example-mtls       # examples/mtls              (mutual TLS, both halves rongo)
 make example-http-server # examples/http_server      (HTTPS server + client, keep-alive)
-make test               # tests (pure parsers + effect mock, no network)
+make test               # tests (pure parsers, effect mock, live paths over loopback)
 make test-native-package # transitive native-dependency consumer build
 ```
 
-`kai test` covers the pure URL parser and the `Tls` effect against a
-mock handler — the runner installs no `Ffi` capability, so a test block
-cannot drive the real OpenSSL path. That path is exercised by the
-runnable examples: `https_post`'s >16 KB body spans several TLS records,
+`make test` runs `kai test` over the pure parsers and framing checks,
+the `Tls` effect against a mock handler, and the real OpenSSL path over
+loopback: handshakes and verification failures against the dev CA
+(`make certs`, which the target runs first), the client against a
+scripted HTTPS peer, the server under `serve_with`, and the pool.
+Nothing leaves 127.0.0.1. The runnable examples cover the same paths end
+to end: `https_post`'s >16 KB body spans several TLS records,
 `https_concurrent` proves one request does not block another,
 `https_keepalive` proves a connection is reused across requests,
 `tls_echo` runs rongo's own server and client against each other, and

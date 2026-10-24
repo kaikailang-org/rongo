@@ -1,10 +1,10 @@
 name: ci
 
-# The unit tests (kai test) cover pure parsing and the Tls effect mock,
-# but kaikai's test runner installs no Ffi capability, so the real
-# OpenSSL path — handshake, cert verification, EINTR retry, send_all's
-# partial-write loop — is only exercised by the runnable examples. This
-# workflow runs them so those paths cannot regress silently.
+# `make test` covers the pure parsers, the Tls effect mock and the real
+# OpenSSL path over loopback (handshake, cert verification, the client,
+# the server, the pool) against the dev certs. The runnable examples
+# exercise the same paths end to end, several of them against live
+# servers, so this workflow runs them too.
 
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
       - name: Verify kaikai
         run: kai --version
 
-      - name: Unit tests (pure parsers + effect mock)
+      - name: Tests (pure parsers, effect mock, loopback TLS)
         run: make test
 
       - name: Native shim propagates to package consumers
