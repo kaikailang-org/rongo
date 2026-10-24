@@ -180,16 +180,20 @@ fn prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
   [b, ...rest] -> prepend(rest, [b, ...acc])
 }
 
-# Does `raw` hold a complete HTTP/1.1 response for a `method` request?
-# Body framing per RFC 9110 §6.4.1:
-#   - HEAD response, or status 1xx / 204 / 304: NO body ever — complete
-#     at the blank line, regardless of Content-Length.
-#   - Transfer-Encoding: chunked: complete when the 0-size chunk is parsed.
-#   - Content-Length: N: complete when N body bytes have arrived.
-#   - none of the above: the body runs to connection close (no keep-alive
-#     framing) — never "complete" until the peer closes (handled by the
-#     recv loop's EOF branch).
-fn response_complete(raw: String, method: String) : Bool {
+#[doc("""
+Does `raw` hold a complete HTTP/1.1 response to a `method` request? The
+client's read loop stops on this, so it decides where one response ends
+on a keep-alive connection. Body framing per RFC 9110 §6.4.1:
+  - HEAD response, or status 1xx / 204 / 304: NO body ever — complete
+    at the blank line, regardless of Content-Length.
+  - Transfer-Encoding: chunked: complete when the 0-size chunk and the
+    blank line after it (and any trailers) have arrived.
+  - Content-Length: N: complete when N body bytes have arrived.
+  - none of the above: the body runs to connection close — never
+    complete until the peer closes (the read loop's EOF branch).
+Header names are matched case-insensitively.
+""")]
+pub fn response_complete(raw: String, method: String) : Bool {
   let sep = "\r\n\r\n"
   let i = find(raw, sep)
   if i < 0 {

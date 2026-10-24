@@ -1,0 +1,182 @@
+# Where one HTTPS response ends — `https.response_complete`, the check the
+# client's read loop stops on. Pure: no network, no FFI. On a keep-alive
+# connection the server never closes, so a response judged complete too
+# late hangs the client and one judged complete too early hands back a
+# truncated body and leaves the rest to corrupt the next response.
+
+import rongo.https
+
+fn get(raw: String) : Bool = https.response_complete(raw, "GET")
+
+fn ok_head(extra: String) : String = string_concat_all(["HTTP/1.1 200 OK\r\n", extra, "\r\n"])
+
+fn chunked(body: String) : String = string_concat("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", body)
+
+# ---- the head -------------------------------------------------------
+
+test "nothing is complete before the blank line" {
+  assert not get("")
+  assert not get("HTTP/1.1 204 No Content\r\n")
+  assert not get("HTTP/1.1 204 No Content\r\nX: y\r\n\r")
+}
+
+test "the status code is the second field of the status line" {
+  # The line is split on single spaces, so a leading space makes the
+  # first field empty and the code the second one, as for any line.
+  assert get(" 204 x\r\n\r\n")
+}
+
+# ---- responses that never carry a body ----------------------------
+
+test "a HEAD response ends at the blank line whatever its headers say" {
+  assert https.response_complete(ok_head("Content-Length: 10\r\n"), "HEAD")
+  assert https.response_complete(ok_head("Transfer-Encoding: chunked\r\n"), "HEAD")
+  assert https.response_complete("\r\n\r\n", "HEAD")
+}
+
+test "the same response to a GET waits for its body" {
+  assert not get(ok_head("Content-Length: 10\r\n"))
+}
+
+test "informational, 204 and 304 responses have no body" {
+  assert get("HTTP/1.1 100 Continue\r\n\r\n")
+  assert get("HTTP/1.1 199 Whatever\r\n\r\n")
+  assert get("HTTP/1.1 204 No Content\r\nContent-Length: 10\r\n\r\n")
+  assert get("HTTP/1.1 304 Not Modified\r\nContent-Length: 10\r\n\r\n")
+}
+
+test "other statuses without framing run to the connection's close" {
+  assert not get("HTTP/1.1 200 OK\r\n\r\n")
+  assert not get("HTTP/1.1 205 Reset Content\r\n\r\nbody")
+  assert not get("HTTP/1.1 303 See Other\r\n\r\n")
+  assert not get("HTTP/1.1 099 Early\r\n\r\n")
+}
+
+test "a status line with no number is not bodyless" {
+  assert not get("garbage\r\n\r\n")
+  assert not get("HTTP/1.1 OK\r\n\r\n")
+  assert not get("HTTP/1.1\r\n\r\n")
+}
+
+# ---- Content-Length -------------------------------------------------
+
+test "Content-Length is complete once that many body bytes are in" {
+  let head = ok_head("Content-Length: 5\r\n")
+  assert not get(string_concat(head, "hell"))
+  assert get(string_concat(head, "hello"))
+  assert get(string_concat(head, "hello!"))
+}
+
+test "Content-Length: 0 is complete at the blank line" {
+  assert get(ok_head("Content-Length: 0\r\n"))
+}
+
+test "an unreadable Content-Length is not framing" {
+  assert not get(string_concat(ok_head("Content-Length: five\r\n"), "hello"))
+}
+
+test "header names match in any case" {
+  assert get(string_concat(ok_head("content-length: 2\r\n"), "hi"))
+  assert get(string_concat(ok_head("CONTENT-LENGTH: 2\r\n"), "hi"))
+  assert not get(string_concat(ok_head("CONTENT-LENGTH: 3\r\n"), "hi"))
+}
+
+test "whitespace around a header value is ignored" {
+  assert get(string_concat(ok_head("Content-Length:2\r\n"), "hi"))
+  assert not get(string_concat(ok_head("Content-Length:3\r\n"), "hi"))
+  assert get(string_concat(ok_head("Content-Length: 2 \r\n"), "hi"))
+  assert get(string_concat(ok_head("Content-Length:\t2\t\r\n"), "hi"))
+  assert not get(string_concat(ok_head("Content-Length: 3 \r\n"), "hi"))
+}
+
+test "the first of two Content-Length headers wins" {
+  let raw = string_concat(ok_head("Content-Length: 5\r\nContent-Length: 2\r\n"), "hi")
+  assert not get(raw)
+}
+
+test "a header line with no colon is skipped" {
+  assert get(string_concat(ok_head("junk\r\nContent-Length: 2\r\n"), "hi"))
+}
+
+# ---- Transfer-Encoding ----------------------------------------------
+
+test "a non-chunked Transfer-Encoding runs to close, ignoring Content-Length" {
+  assert not get(string_concat(ok_head("Transfer-Encoding: gzip\r\nContent-Length: 5\r\n"), "hello"))
+}
+
+test "chunked is recognised in any case and in a coding list" {
+  assert get(string_concat(ok_head("TRANSFER-ENCODING: CHUNKED\r\n"), "0\r\n\r\n"))
+  assert get(string_concat(ok_head("transfer-encoding:chunked\r\n"), "0\r\n\r\n"))
+  assert get(string_concat(ok_head("Transfer-Encoding: gzip, chunked\r\n"), "0\r\n\r\n"))
+}
+
+test "chunked takes precedence over Content-Length" {
+  let head = ok_head("Content-Length: 3\r\nTransfer-Encoding: chunked\r\n")
+  assert not get(string_concat(head, "abc"))
+  assert get(string_concat(head, "3\r\nabc\r\n0\r\n\r\n"))
+}
+
+# ---- chunked bodies -------------------------------------------------
+
+test "a chunked body is complete at the terminator and its blank line" {
+  assert get(chunked("5\r\nhello\r\n0\r\n\r\n"))
+  assert get(chunked("3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"))
+  assert get(chunked("0\r\n\r\n"))
+}
+
+test "a chunked body is incomplete until every part has arrived" {
+  assert not get(chunked(""))
+  assert not get(chunked("5"))
+  assert not get(chunked("5\r\n"))
+  assert not get(chunked("5\r\nhel"))
+  assert not get(chunked("5\r\nhello"))
+  assert not get(chunked("5\r\nhello\r\n"))
+  assert not get(chunked("5\r\nhello\r\n0\r\n"))
+  assert not get(chunked("3\r\nabc\r\n2\r\nd"))
+}
+
+test "an empty chunk-size line is not a terminator" {
+  assert not get(chunked("\r\n"))
+  assert not get(chunked("\r\n\r\n"))
+}
+
+test "chunk data that looks like a terminator is still data" {
+  # A size line read as 0 would end the body at the CRLF pair inside the
+  # data; the real size says more data is still to come.
+  assert not get(chunked("5\r\n\r\n\r\nX"))
+  assert not get(chunked("9\r\n\r\n\r\nXY"))
+  assert not get(chunked("a\r\n\r\n\r\nXY"))
+  assert not get(chunked("f\r\n\r\n\r\nXY"))
+  assert not get(chunked("A\r\n\r\n\r\nXY"))
+  assert not get(chunked("F\r\n\r\n\r\nXY"))
+  assert not get(chunked("10\r\n\r\n\r\nXY"))
+}
+
+test "chunk sizes are hexadecimal, in either case" {
+  assert get(chunked("9\r\n123456789\r\n0\r\n\r\n"))
+  assert get(chunked("a\r\n0123456789\r\n0\r\n\r\n"))
+  assert get(chunked("A\r\n0123456789\r\n0\r\n\r\n"))
+  assert get(chunked("f\r\n0123456789abcde\r\n0\r\n\r\n"))
+  assert get(chunked("F\r\n0123456789abcde\r\n0\r\n\r\n"))
+  assert get(chunked("10\r\n0123456789abcdef\r\n0\r\n\r\n"))
+  # 0x10 is sixteen bytes, not one.
+  assert not get(chunked("10\r\nA\r\n0\r\n\r\n"))
+}
+
+test "whitespace around a chunk size is ignored" {
+  assert get(chunked(" 5 \r\nhello\r\n0\r\n\r\n"))
+  assert not get(chunked(" 4\r\n\r\n\r\n\r\n0\r\n"))
+}
+
+test "a chunk extension does not change the size" {
+  assert get(chunked("5;name=value\r\nhello\r\n0\r\n\r\n"))
+  assert get(chunked("0;last\r\n\r\n"))
+  assert not get(chunked("5;name=value\r\nhel"))
+}
+
+test "trailers after the terminator must end with their blank line" {
+  assert get(chunked("0\r\nX-Checksum: 1\r\n\r\n"))
+  assert not get(chunked("0\r\nX-Checksum: 1\r\n"))
+}
+
+fn main() : Int = 0
