@@ -231,7 +231,7 @@ fn serve_requests[e](c: tls.TlsConn, cfg: Config, handler: (http.Request) -> htt
       let resp = run_handler(handler, req)
       # Continue the connection only if config, client, AND handler all
       # allow it — the handler may force close via its own Connection header.
-      let keep = (cfg.keep_alive and (not client_wants_close(req))) and (not handler_wants_close(resp))
+      let keep = (cfg.keep_alive and (not asks_close(req.headers))) and (not asks_close(resp.headers))
       let wire = http.serialize_response(with_connection_header(resp, keep))
       let _ = tls.send(c, http.string_to_bytes(wire))
       if keep {
@@ -256,10 +256,16 @@ fn run_handler[e](handler: (http.Request) -> http.Response / e, req: http.Reques
   raise(resume) -> http.Response { status: 500, headers: [http.HttpHeader { name: "Connection", value: "close" }], body: "internal server error" }
 }
 
-# Does the client ask to close (`Connection: close`)?
-fn client_wants_close(req: http.Request) : Bool = match http.header_lookup(req.headers, "Connection") {
-  Some(v) -> lower(trim(v)) == "close"
-  None -> false
+# Do these headers ask to close (`Connection: close`)? Asked of the
+# client's request and of the handler's response alike. The first
+# Connection header decides; its name matches in any letter case.
+fn asks_close(hs: [http.HttpHeader]) : Bool = match hs {
+  [] -> false
+  [h, ...rest] -> if lower(h.name) == "connection" {
+    lower(trim(h.value)) == "close"
+  } else {
+    asks_close(rest)
+  }
 }
 
 # Set the response's Connection header to match what the server will do,
@@ -273,12 +279,6 @@ fn with_connection_header(resp: http.Response, keep: Bool) : http.Response {
   }
   let others = list.filter(resp.headers, h => lower(h.name) != "connection")
   http.Response { status: resp.status, headers: [http.HttpHeader { name: "Connection", value: val }, ...others], body: resp.body }
-}
-
-# Whether the handler's own response asked to close the connection.
-fn handler_wants_close(resp: http.Response) : Bool = match http.header_lookup(resp.headers, "Connection") {
-  Some(v) -> lower(trim(v)) == "close"
-  None -> false
 }
 
 # ---- accept loop --------------------------------------------------
