@@ -61,4 +61,76 @@ test "parse_url rejects a missing scheme separator" {
   }
 }
 
+fn err_of(s: String) : String = match https.parse_url(s) {
+  Ok(_) -> "parsed"
+  Err(e) -> e
+}
+
+fn port_of(s: String) : Int = match https.parse_url(s) {
+  Ok(u) -> u.port
+  Err(_) -> 0 - 1
+}
+
+test "parse_url names the scheme it refuses" {
+  assert err_of("http://example.com/") == "https.parse_url: only https:// is supported (got 'http://')"
+  assert err_of("://example.com/") == "https.parse_url: only https:// is supported (got '://')"
+  assert err_of("example.com") == "https.parse_url: missing scheme separator '://'"
+}
+
+test "parse_url rejects an empty host" {
+  assert err_of("https://") == "https.parse_url: empty host"
+  assert err_of("https:///path") == "https.parse_url: empty host"
+  assert err_of("https://:8443/") == "https.parse_url: empty host"
+}
+
+test "parse_url accepts a one-letter host" {
+  match https.parse_url("https://a/") {
+    Ok(u) -> {
+      assert u.host == "a"
+    }
+    Err(_) -> {
+      assert false
+    }
+  }
+}
+
+test "parse_url keeps an explicit port with no path" {
+  match https.parse_url("https://h:8443") {
+    Ok(u) -> {
+      assert u.host == "h"
+      assert u.port == 8443
+      assert u.path == "/"
+    }
+    Err(_) -> {
+      assert false
+    }
+  }
+}
+
+test "parse_url treats an empty port as the default" {
+  assert port_of("https://h:/") == 443
+  assert port_of("https://h:443/") == 443
+}
+
+test "parse_url accepts every TCP port and nothing else" {
+  assert port_of("https://h:1/") == 1
+  assert port_of("https://h:65535/") == 65535
+  assert err_of("https://h:0/") == "https.parse_url: invalid port"
+  assert err_of("https://h:65536/") == "https.parse_url: invalid port"
+  assert err_of("https://h:-1/") == "https.parse_url: invalid port"
+  assert err_of("https://h:http/") == "https.parse_url: invalid port"
+  assert err_of("https://h:80x/") == "https.parse_url: invalid port"
+}
+
+test "parse_url keeps the query in the path" {
+  match https.parse_url("https://h/a/b?x=1&y=2") {
+    Ok(u) -> {
+      assert u.path == "/a/b?x=1&y=2"
+    }
+    Err(_) -> {
+      assert false
+    }
+  }
+}
+
 fn main() : Int = 0

@@ -24,7 +24,8 @@ import rongo.ffi.tls
 #
 # net.http.parse_url rejects `https://` by design, so rongo carries its
 # own parser. Shape: `https://<host>[:<port>][/<path>]`, default port
-# 443, path normalised to begin with `/`.
+# 443, path normalised to begin with `/`. An empty port (`host:`) is the
+# default too; anything else after the colon must be a port number.
 
 fn find(hay: String, needle: String) : Int = find_loop(hay, needle, 0, string_length(hay), string_length(needle))
 
@@ -45,10 +46,21 @@ fn split_authority(auth: String) : http.HttpHostPort {
   } else {
     let h = string_slice(auth, 0, i)
     let rest = string_slice(auth, i + 1, (string_length(auth) - i) - 1)
-    match string_to_int(rest) {
-      Some(p) -> http.HttpHostPort { host: h, port: p }
-      None -> http.HttpHostPort { host: h, port: 0 }
+    http.HttpHostPort { host: h, port: port_of(rest) }
+  }
+}
+
+# 0 for no port at all, -1 for one that is not a TCP port number.
+fn port_of(s: String) : Int = if string_length(s) == 0 {
+  0
+} else {
+  match string_to_int(s) {
+    Some(p) -> if (p >= 1) and (p <= 65535) {
+      p
+    } else {
+      0 - 1
     }
+    None -> 0 - 1
   }
 }
 
@@ -86,6 +98,8 @@ pub fn parse_url(s: String) : Result[http.HttpUrl, String] {
       }
       if string_length(hp.host) == 0 {
         Err("https.parse_url: empty host")
+      } else if hp.port < 0 {
+        Err("https.parse_url: invalid port")
       } else {
         Ok(http.HttpUrl { scheme: "https", host: hp.host, port: port, path: path })
       }
