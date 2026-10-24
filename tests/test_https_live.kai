@@ -1,0 +1,371 @@
+# The HTTPS client over loopback. The server is scripted: it accepts one
+# connection, records each request exactly as it arrived, and answers with
+# a fixed byte sequence — split into parts with a pause between them when
+# the test is about reassembly — so a test can pin both what the client
+# writes and how it reads what comes back. Nothing leaves 127.0.0.1.
+#
+# `connect` and `open_session` verify against the system trust store, so
+# this process points OpenSSL's default store at the dev CA first.
+
+import rongo.https
+
+import rongo.http_server
+
+import rongo.ffi.tls
+
+import net.http
+
+import os.env
+
+import os.process
+
+import spawn
+
+import time
+
+const CA : String = "test-certs/ca.crt"
+
+const CERT : String = "test-certs/server.crt"
+
+const KEY : String = "test-certs/server.key"
+
+# Below the ephemeral range the listeners here are given, so nothing in
+# the suite listens on it: connecting is refused.
+const CLOSED_PORT : Int = 18449
+
+const PEER_CLOSED : String = "recv: https: peer closed before any response"
+
+fn trust_dev_ca() : Unit / Env {
+  let _ = env.set("SSL_CERT_FILE", CA)
+}
+
+fn url(port: Int, path: String) : String = "https://localhost:#{int_to_string(port)}#{path}"
+
+# Exits rather than raising: a test that dies of an unhandled Cancel is
+# not reported as a failure.
+fn listen_or_fail(port: Int) : tls.TlsListener / NetTcp + Ffi + Process + Stdout = match tls.listen("127.0.0.1", port, CERT, KEY) {
+  Ok(l) -> l
+  Err(e) -> {
+    print("listen #{int_to_string(port)}: #{e}")
+    process.exit(1)
+  }
+}
+
+# Read one request: until it is complete, or the client stops sending.
+fn read_request(c: tls.TlsConn, acc: String) : String / NetTcp + Ffi = if http_server.request_complete(acc) {
+  acc
+} else {
+  match tls.recv(c, 4096) {
+    Err(_) -> acc
+    Ok([]) -> acc
+    Ok(bs) -> read_request(c, string_concat(acc, http.bytes_to_string(bs)))
+  }
+}
+
+fn send_parts(c: tls.TlsConn, parts: [String]) : Unit / NetTcp + Ffi + Clock = match parts {
+  [] -> ()
+  [p, ...rest] -> {
+    let _ = tls.send(c, http.string_to_bytes(p))
+    match rest {
+      [] -> ()
+      _ -> sleep(millis(20))
+    }
+    send_parts(c, rest)
+  }
+}
+
+fn wait_for_close(c: tls.TlsConn) : Unit / NetTcp + Ffi = match tls.recv(c, 4096) {
+  Ok([]) -> ()
+  Err(_) -> ()
+  Ok(_) -> wait_for_close(c)
+}
+
+fn script_loop(c: tls.TlsConn, replies: [[String]], acc: [String]) : [String] / NetTcp + Ffi + Clock = match replies {
+  [] -> list_reverse(acc)
+  [r, ...rest] -> {
+    let q = read_request(c, "")
+    send_parts(c, r)
+    script_loop(c, rest, [q, ...acc])
+  }
+}
+
+# Accept one connection and answer one request per entry of `replies`.
+# Then hang up at once (`hang_up`), or wait for the client to close.
+# Returns the requests as they arrived.
+fn scripted(l: tls.TlsListener, replies: [[String]], hang_up: Bool) : [String] / NetTcp + Ffi + Clock = match tls.accept(l) {
+  Err(e) -> [string_concat("accept: ", e)]
+  Ok(c) -> {
+    let reqs = script_loop(c, replies, [])
+    if not hang_up {
+      wait_for_close(c)
+    }
+    tls.close(c)
+    reqs
+  }
+}
+
+# Accept `n` connections in turn; answer each one's request with its
+# request line, and hang up.
+fn echo_request_lines(l: tls.TlsListener, n: Int) : Unit / NetTcp + Ffi = if n > 0 {
+  match tls.accept(l) {
+    Err(_) -> ()
+    Ok(c) -> {
+      let q = read_request(c, "")
+      let line = match string_split(q, "\r\n") {
+        [first, ...__rest__] -> first
+        [] -> ""
+      }
+      let resp = http.Response { status: 200, headers: [], body: line }
+      let _ = tls.send(c, http.string_to_bytes(http.serialize_response(resp)))
+      tls.close(c)
+    }
+  }
+  echo_request_lines(l, n - 1)
+}
+
+fn ok_with(body: String) : String = "HTTP/1.1 200 OK\r\nContent-Length: #{int_to_string(string_length(body))}\r\n\r\n#{body}"
+
+fn header(r: http.Response, name: String) : String = match http.header_lookup(r.headers, name) {
+  Some(v) -> v
+  None -> ""
+}
+
+# ---- what the client writes -----------------------------------------
+
+test "request writes the request line, Host, Content-Length and the caller's headers" {
+  trust_dev_ca()
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let reply = ["HTTP/1.1 201 Created\r\nContent-Length: 5\r\nX-Reply: yes\r\n", "\r\nhel", "lo"]
+  let r = nursery(() => {
+    let srv = spawn(() => scripted(l, [reply], true))
+    let req = http.Request { method: "POST", url: url(port, "/a/b?q=1"), headers: [http.HttpHeader { name: "X-Test", value: "1" }], body: "abc" }
+    let resp = https.request(req)
+    Pair { fst: resp, snd: await(srv) }
+  })
+  tls.close_listener(l)
+  assert r.fst.status == 201
+  assert r.fst.body == "hello"
+  assert header(r.fst, "X-Reply") == "yes"
+  assert r.snd == ["POST /a/b?q=1 HTTP/1.1\r\nHost: localhost:#{int_to_string(port)}\r\nContent-Length: 3\r\nX-Test: 1\r\n\r\nabc"]
+}
+
+test "get, post, put and delete send their own verb" {
+  trust_dev_ca()
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => echo_request_lines(l, 4))
+    let g = https.get(url(port, "/g")).body
+    let p = https.post(url(port, "/p"), "x").body
+    let u = https.put(url(port, "/u"), "y").body
+    let d = https.delete(url(port, "/d")).body
+    await(srv)
+    [g, p, u, d]
+  })
+  tls.close_listener(l)
+  assert r == ["GET /g HTTP/1.1", "POST /p HTTP/1.1", "PUT /u HTTP/1.1", "DELETE /d HTTP/1.1"]
+}
+
+# ---- a keep-alive session -------------------------------------------
+
+test "a session carries several requests over one connection" {
+  trust_dev_ca()
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let replies = [
+    [ok_with("one")],
+    ["HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"],
+    ["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "3\r\ntwo\r\n", "0\r\n\r\n"]
+  ]
+  let r = nursery(() => {
+    let srv = spawn(() => scripted(l, replies, false))
+    match https.open_session("localhost", port) {
+      Err(e) -> Pair { fst: [e], snd: await(srv) }
+      Ok(s) -> {
+        let a = https.session_get(s, url(port, "/1"))
+        # A HEAD response has no body, whatever its Content-Length says;
+        # reading one would swallow the next response.
+        let b = https.session_request(s, http.Request { method: "HEAD", url: url(port, "/2"), headers: [], body: "" })
+        let c = https.session_get(s, url(port, "/3"))
+        https.close_session(s)
+        let got = [int_to_string(a.status), a.body, int_to_string(b.status), b.body, int_to_string(c.status), c.body]
+        Pair { fst: got, snd: await(srv) }
+      }
+    }
+  })
+  tls.close_listener(l)
+  assert r.fst == ["200", "one", "200", "", "200", "two"]
+  assert r.snd == ["GET /1 HTTP/1.1\r\nHost: localhost:#{int_to_string(port)}\r\nContent-Length: 0\r\n\r\n", "HEAD /2 HTTP/1.1\r\nHost: localhost:#{int_to_string(port)}\r\nContent-Length: 0\r\n\r\n", "GET /3 HTTP/1.1\r\nHost: localhost:#{int_to_string(port)}\r\nContent-Length: 0\r\n\r\n"]
+}
+
+test "the Host header leaves out the default port" {
+  # The session is open to a test port, but the request's own URL says
+  # 443, and Host is built from the request's URL.
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => scripted(l, [[ok_with("")]], false))
+    match https.open_session_ca("localhost", port, CA) {
+      Err(e) -> [e]
+      Ok(s) -> {
+        let _ = https.session_get(s, "https://example.test/x")
+        https.close_session(s)
+        await(srv)
+      }
+    }
+  })
+  tls.close_listener(l)
+  assert r == ["GET /x HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n"]
+}
+
+test "a session request with a URL it cannot parse sends nothing" {
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => scripted(l, [[ok_with("after")]], false))
+    match https.open_session_ca("localhost", port, CA) {
+      Err(e) -> Pair { fst: http.Response { status: 0 - 1, headers: [], body: e }, snd: "" }
+      Ok(s) -> {
+        let bad = https.session_request(s, http.Request { method: "GET", url: "http://localhost/", headers: [], body: "" })
+        let good = https.session_get(s, url(port, "/after"))
+        https.close_session(s)
+        let _ = await(srv)
+        Pair { fst: bad, snd: good.body }
+      }
+    }
+  })
+  tls.close_listener(l)
+  assert r.fst.status == 0
+  assert r.fst.body == "https.parse_url: only https:// is supported (got 'http://')"
+  assert r.snd == "after"
+}
+
+# ---- how the client reads what comes back ---------------------------
+
+test "a peer that hangs up before answering is a status-0 response" {
+  trust_dev_ca()
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => scripted(l, [[]], true))
+    let resp = https.get(url(port, "/"))
+    let _ = await(srv)
+    resp
+  })
+  tls.close_listener(l)
+  assert r.status == 0
+  assert r.body == PEER_CLOSED
+}
+
+test "a body with no framing runs to the close" {
+  trust_dev_ca()
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => scripted(l, [["HTTP/1.1 200 OK\r\n\r\nto the ", "end"]], true))
+    let resp = https.get(url(port, "/"))
+    let _ = await(srv)
+    resp
+  })
+  tls.close_listener(l)
+  assert r.status == 200
+  assert r.body == "to the end"
+}
+
+test "a response cut short is a parse failure, not a missing response" {
+  trust_dev_ca()
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => scripted(l, [["H"]], true))
+    let resp = https.get(url(port, "/"))
+    let _ = await(srv)
+    resp
+  })
+  tls.close_listener(l)
+  assert r.status == 0
+  assert string.starts_with(r.body, "parse_response:")
+}
+
+test "a session whose peer has hung up fails its next requests" {
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => scripted(l, [[ok_with("ok")]], true))
+    match https.open_session_ca("localhost", port, CA) {
+      Err(e) -> [e]
+      Ok(s) -> {
+        let a = https.session_get(s, url(port, "/1"))
+        let _ = await(srv)
+        let b = https.session_get(s, url(port, "/2"))
+        let c = https.session_get(s, url(port, "/3"))
+        https.close_session(s)
+        [int_to_string(a.status), a.body, int_to_string(b.status), b.body, int_to_string(c.status), c.body]
+      }
+    }
+  })
+  tls.close_listener(l)
+  # The third may also fail to send, once the transport has noticed.
+  assert list.take(r, 5) == ["200", "ok", "0", PEER_CLOSED, "0"]
+}
+
+# ---- failures before any exchange -----------------------------------
+
+test "a URL request cannot parse is a status-0 response" {
+  let r = https.get("ftp://localhost/")
+  assert r.status == 0
+  assert r.body == "https.parse_url: only https:// is supported (got 'ftp://')"
+}
+
+test "a connection that cannot be opened is a status-0 response" {
+  let r = https.get(url(CLOSED_PORT, "/"))
+  assert r.status == 0
+  assert string.starts_with(r.body, "connect: tls: connect: ")
+  let s = match https.open_session("localhost", CLOSED_PORT) {
+    Ok(s) -> {
+      https.close_session(s)
+      "opened"
+    }
+    Err(e) -> e
+  }
+  assert string.starts_with(s, "tls: connect: ")
+  let t = match https.open_session_ca("localhost", CLOSED_PORT, CA) {
+    Ok(s) -> {
+      https.close_session(s)
+      "opened"
+    }
+    Err(e) -> e
+  }
+  assert string.starts_with(t, "tls: connect: ")
+}
+
+# ---- one connection per request -------------------------------------
+
+fn hello(req: http.Request) : http.Response = http.Response { status: 200, headers: [], body: req.url }
+
+fn get_many(port: Int, n: Int, acc: [Int]) : [Int] / NetTcp + Ffi = if n == 0 {
+  acc
+} else {
+  get_many(port, n - 1, [https.get(url(port, "/")).status, ...acc])
+}
+
+test "request closes the connection it opened" {
+  # The server keeps a connection open until the client closes it, so a
+  # request that left its connection open would hold two slots of the
+  # shim's 128 — one per end — and 70 of them would run the table dry.
+  trust_dev_ca()
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => http_server.serve(l, hello))
+    let statuses = get_many(port, 70, [])
+    cancel(srv)
+    statuses
+  })
+  tls.close_listener(l)
+  assert list_length(r) == 70
+  assert list.all(r, s => s == 200)
+}
+
+fn main() : Int = 0

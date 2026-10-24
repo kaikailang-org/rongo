@@ -1,8 +1,7 @@
 # The shim's answers, decoded — no socket, no OpenSSL, no FFI. These are
 # the decisions the TLS driver makes on every handshake step and every
-# read, and they are the only part of the driver a test can reach: the
-# test runner installs no Ffi capability, so anything that calls the shim
-# is out of reach by construction.
+# read. A live handshake reaches only the codes a real peer provokes
+# (tests/test_tls_live.kai); here every one of them is reached directly.
 #
 # Every status code and every frame tag the shim can emit is covered
 # here, including the ones that mean "this cannot have come from the

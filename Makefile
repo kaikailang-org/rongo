@@ -46,7 +46,8 @@ OPENSSL_BIN := $(shell $(PKG_ENV) pkg-config --variable=prefix openssl)/bin/open
 
 all: build/rongo
 
-# Dev certs for the TLS examples. Dev only — never real keys. Gitignored.
+# Dev certs for the TLS examples and the live tests. Dev only — never real
+# keys. Gitignored.
 # One dev CA signs both the server cert (CN=localhost + SAN) and a client
 # cert, so the mTLS example anchors both ends to the same authority. The
 # plain server example (tls_echo) uses connect_insecure and ignores the CA.
@@ -145,9 +146,11 @@ example-http-server: build/http_server
 build/http_server: examples/http_server/main.kai $(LIB_SRCS) | build
 	$(call build_example,examples/http_server/main.kai,$@)
 
-# Package tests: pure parsers + the effect mock (no network) run under
-# `kai test`; the shim is linked so the FFI externs resolve.
-test: $(SHIM)
+# Package tests under `kai test`: the pure parsers and the effect mock,
+# and the live TLS / HTTPS / server / pool paths over loopback against
+# the dev certs (127.0.0.1 only, never the internet). The shim is linked
+# so the FFI externs resolve.
+test: $(SHIM) certs
 	CFLAGS="$(KAI_CFLAGS)" $(KAI_BIN) test .
 
 # Build a separate package that depends on Rongo by path. This catches the

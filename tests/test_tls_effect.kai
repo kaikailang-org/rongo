@@ -2,8 +2,25 @@
 # OpenSSL. The payoff of the effect layer: a test drives TLS-shaped code
 # by substituting the handler. The ops carry pure data (no connection
 # handle), so the mock fabricates nothing — it just scripts bytes.
+#
+# The production handler, `tls_wrap`, is exercised at the end of the
+# file over loopback, against rongo's own server and the dev CA.
 
-import rongo.tls.{Tls}
+import rongo.tls.{Tls, tls_wrap}
+
+import rongo.ffi.tls
+
+import rongo.http_server
+
+import rongo.https
+
+import net.http
+
+import os.env
+
+import os.process
+
+import spawn
 
 # A mock handler: write is a no-op success, read returns canned "hi",
 # close does nothing. No handle to mint — the effect has none.
@@ -51,6 +68,77 @@ test "a mock read can report an error" {
     }
     Err(e) -> {
       assert e == "mock: connection reset"
+    }
+  }
+}
+
+# ---- the production handler, over loopback --------------------------
+
+# Write a GET, then read until one whole response is in.
+fn fetch() : Result[String, String] / Tls = match Tls.write(http.string_to_bytes("GET /wrapped HTTP/1.1\r\nHost: localhost\r\n\r\n")) {
+  Err(e) -> Err(e)
+  Ok(_) -> read_response("")
+}
+
+fn read_response(acc: String) : Result[String, String] / Tls = if https.response_complete(acc, "GET") {
+  Ok(acc)
+} else {
+  match Tls.read(4096) {
+    Err(e) -> Err(e)
+    Ok([]) -> Ok(acc)
+    Ok(bs) -> read_response(string_concat(acc, http.bytes_to_string(bs)))
+  }
+}
+
+fn hello(req: http.Request) : http.Response = http.Response { status: 200, headers: [], body: req.url }
+
+fn wrap_many(port: Int, n: Int, acc: [Result[String, String]]) : [Result[String, String]] / NetTcp + Ffi = if n == 0 {
+  acc
+} else {
+  let r = match tls_wrap("localhost", port, fetch) {
+    Err(e) -> Err(e)
+    Ok(inner) -> inner
+  }
+  wrap_many(port, n - 1, [r, ...acc])
+}
+
+fn is_ok_response(r: Result[String, String]) : Bool = match r {
+  Ok(raw) -> string.starts_with(raw, "HTTP/1.1 200 OK\r\n") and string.ends_with(raw, "/wrapped")
+  Err(_) -> false
+}
+
+test "tls_wrap runs the body over a verified connection and closes it" {
+  # The server keeps each connection open until the client closes it, so
+  # a scope that left its connection open would hold two of the shim's
+  # 128 slots, and 70 scopes would run the table dry.
+  let _ = env.set("SSL_CERT_FILE", "test-certs/ca.crt")
+  match tls.listen("127.0.0.1", 0, "test-certs/server.crt", "test-certs/server.key") {
+    Err(e) -> {
+      print(e)
+      process.exit(1)
+    }
+    Ok(l) -> {
+      let rs = nursery(() => {
+        let srv = spawn(() => http_server.serve(l, hello))
+        let rs = wrap_many(tls.local_port(l), 70, [])
+        cancel(srv)
+        rs
+      })
+      tls.close_listener(l)
+      assert list_length(rs) == 70
+      assert list.all(rs, is_ok_response)
+    }
+  }
+}
+
+test "tls_wrap reports a connection it cannot open" {
+  # Below the ephemeral range, and nothing in the suite listens there.
+  match tls_wrap("127.0.0.1", 18448, fetch) {
+    Ok(_) -> {
+      assert false
+    }
+    Err(e) -> {
+      assert string.starts_with(e, "tls: connect: ")
     }
   }
 }

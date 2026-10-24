@@ -1,0 +1,219 @@
+# The connection pool over loopback. The server numbers its connections
+# and answers every request with that number (`c1`, `c2`, ...), so a test
+# sees which connection served each request: reused, or freshly opened.
+# Nothing leaves 127.0.0.1.
+#
+# Several tests lean on the shim's table of 128 connection slots: a path
+# that forgets to close a connection holds a slot (two, while the server
+# keeps its end open), and a loop of requests runs the table dry.
+
+import rongo.pool
+
+import rongo.http_server
+
+import rongo.ffi.tls
+
+import net.http
+
+import os.env
+
+import os.process
+
+import spawn
+
+import time
+
+const CA : String = "test-certs/ca.crt"
+
+# How the numbering server treats each connection.
+type Mode
+  = KeepAlive
+  | CloseAfterOne
+  | HangUpUnanswered
+
+fn listen_or_exit(port: Int) : tls.TlsListener / NetTcp + Ffi + Process + Stdout = match tls.listen("127.0.0.1", port, "test-certs/server.crt", "test-certs/server.key") {
+  Ok(l) -> l
+  Err(e) -> {
+    print("listen #{int_to_string(port)}: #{e}")
+    process.exit(1)
+  }
+}
+
+fn read_request(c: tls.TlsConn, acc: String) : String / NetTcp + Ffi = if http_server.request_complete(acc) {
+  acc
+} else {
+  match tls.recv(c, 4096) {
+    Err(_) -> ""
+    Ok([]) -> ""
+    Ok(bs) -> read_request(c, string_concat(acc, http.bytes_to_string(bs)))
+  }
+}
+
+fn serve_numbered(c: tls.TlsConn, k: Int, mode: Mode) : Unit / NetTcp + Ffi = {
+  let q = read_request(c, "")
+  if string_length(q) == 0 {
+    tls.close(c)
+  } else {
+    match mode {
+      HangUpUnanswered -> tls.close(c)
+      _ -> {
+        let resp = http.Response { status: 200, headers: [], body: "c#{int_to_string(k)}" }
+        let _ = tls.send(c, http.string_to_bytes(http.serialize_response(resp)))
+        match mode {
+          KeepAlive -> serve_numbered(c, k, mode)
+          _ -> tls.close(c)
+        }
+      }
+    }
+  }
+}
+
+fn accept_numbered(l: tls.TlsListener, k: Int, mode: Mode) : Unit / NetTcp + Ffi + Spawn = match tls.accept(l) {
+  Err(_) -> accept_numbered(l, k, mode)
+  Ok(c) -> {
+    let _ = spawn(() => serve_numbered(c, k, mode))
+    accept_numbered(l, k + 1, mode)
+  }
+}
+
+fn numbering_server(l: tls.TlsListener, mode: Mode) : Unit / NetTcp + Ffi + Spawn = nursery(() => accept_numbered(l, 1, mode))
+
+fn cfg(per_host: Int, idle: Duration) : pool.PoolConfig = pool.PoolConfig { max_per_host: per_host, max_idle: idle, trust: pool.PrivateCA(CA) }
+
+fn url(host: String, port: Int) : String = "https://#{host}:#{int_to_string(port)}/"
+
+# Run `n` GETs through `p`, keeping each response as "<status> <body>".
+fn get_n(p: pool.Pool, u: String, n: Int, acc: [String]) : [String] / NetTcp + Ffi + Mutable + Clock = if n == 0 {
+  list_reverse(acc)
+} else {
+  let r = pool.get(p, u)
+  get_n(p, u, n - 1, ["#{int_to_string(r.status)} #{r.body}", ...acc])
+}
+
+# `n` responses numbered from `from` up, one connection each.
+fn numbered_from(from: Int, n: Int) : [String] = if n == 0 {
+  []
+} else {
+  ["200 c#{int_to_string(from)}", ...numbered_from(from + 1, n - 1)]
+}
+
+# Run `body` against a numbering server, handing it the server's port,
+# then stop the server.
+# OpenSSL reads its default trust store when the process opens its first
+# client connection, so the dev CA is put there before any test connects.
+fn against[a](mode: Mode, body: (Int) -> a / NetTcp + Ffi + Mutable + Clock) : a / NetTcp + Ffi + Mutable + Clock + Spawn + Process + Stdout + Env {
+  let _ = env.set("SSL_CERT_FILE", CA)
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => numbering_server(l, mode))
+    let r = body(port)
+    cancel(srv)
+    r
+  })
+  tls.close_listener(l)
+  r
+}
+
+# ---- reuse ------------------------------------------------------------
+
+test "requests to one host reuse one connection" {
+  let r = against(KeepAlive, port => {
+    let p = pool.new_pool(cfg(8, seconds(90)))
+    let got = get_n(p, url("localhost", port), 3, [])
+    pool.close_pool(p)
+    got
+  })
+  assert r == ["200 c1", "200 c1", "200 c1"]
+}
+
+test "the system trust policy reuses connections too" {
+  let r = against(KeepAlive, port => {
+    let p = pool.new_pool(pool.default_pool_config())
+    let got = get_n(p, url("localhost", port), 2, [])
+    pool.close_pool(p)
+    got
+  })
+  assert r == ["200 c1", "200 c1"]
+}
+
+test "each host:port gets its own connections" {
+  # Same port, two names for the same server: two pool entries.
+  let r = against(KeepAlive, port => {
+    let p = pool.new_pool(cfg(8, seconds(90)))
+    let a = pool.get(p, url("localhost", port)).body
+    let b = pool.get(p, url("127.0.0.1", port)).body
+    let c = pool.get(p, url("localhost", port)).body
+    let d = pool.get(p, url("127.0.0.1", port)).body
+    pool.close_pool(p)
+    [a, b, c, d]
+  })
+  assert r == ["c1", "c2", "c1", "c2"]
+}
+
+# ---- retry --------------------------------------------------------------
+
+test "a connection that died idle is replaced, and closed" {
+  # The server hangs up after every response, so each reused connection
+  # is dead and the pool retries on a fresh one. 130 rounds: a dead
+  # connection the pool did not close would hold a slot each time.
+  let r = against(CloseAfterOne, port => {
+    let p = pool.new_pool(cfg(8, seconds(90)))
+    let got = get_n(p, url("localhost", port), 130, [])
+    pool.close_pool(p)
+    got
+  })
+  assert r == numbered_from(1, 130)
+}
+
+test "a fresh connection that fails is a status-0 response, and closed" {
+  let r = against(HangUpUnanswered, port => {
+    let p = pool.new_pool(cfg(8, seconds(90)))
+    let got = get_n(p, url("localhost", port), 130, [])
+    pool.close_pool(p)
+    got
+  })
+  assert list_length(r) == 130
+  assert list.all(r, s => s == "0 recv: https: peer closed before any response")
+}
+
+# ---- limits -------------------------------------------------------------
+
+test "an expired idle connection is closed, not reused" {
+  # A zero idle timeout expires every connection before its next use. The
+  # server keeps its end open, so an expired connection left unclosed
+  # would hold two slots; 70 rounds would exhaust the table.
+  let r = against(KeepAlive, port => {
+    let p = pool.new_pool(cfg(8, seconds(0)))
+    let got = get_n(p, url("localhost", port), 70, [])
+    pool.close_pool(p)
+    got
+  })
+  assert r == numbered_from(1, 70)
+}
+
+test "a host at its idle cap closes the connection instead of keeping it" {
+  let r = against(KeepAlive, port => {
+    let p = pool.new_pool(cfg(0, seconds(90)))
+    let got = get_n(p, url("localhost", port), 70, [])
+    pool.close_pool(p)
+    got
+  })
+  assert r == numbered_from(1, 70)
+}
+
+fn pools_one_each(port: Int, n: Int, acc: [String]) : [String] / NetTcp + Ffi + Mutable + Clock = if n == 0 {
+  list_reverse(acc)
+} else {
+  let p = pool.new_pool(cfg(8, seconds(90)))
+  let r = pool.get(p, url("localhost", port))
+  pool.close_pool(p)
+  pools_one_each(port, n - 1, ["#{int_to_string(r.status)} #{r.body}", ...acc])
+}
+
+test "close_pool closes the connections it holds" {
+  let r = against(KeepAlive, port => pools_one_each(port, 70, []))
+  assert r == numbered_from(1, 70)
+}
+
+fn main() : Int = 0

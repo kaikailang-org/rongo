@@ -1,0 +1,522 @@
+# The TLS engine over loopback — a real handshake against rongo's own
+# listener, with the dev certificates in test-certs/. Nothing here leaves
+# 127.0.0.1. Where the behaviour under test is how the engine treats a
+# peer that is not TLS (or not well-behaved TLS), the peer is a raw
+# NetTcp socket, which can stay silent, hang up or answer with garbage.
+#
+# The shim keeps a table of 128 connection slots and 16 listeners for
+# the whole process. Several tests lean on that: a path that forgets to
+# free its slot runs the table dry within a loop of failures, and the
+# next connection reports it.
+
+import rongo.ffi.tls
+
+import net.http
+
+import net.tcp
+
+import os.process
+
+import spawn
+
+import time
+
+const CA : String = "test-certs/ca.crt"
+
+const CERT : String = "test-certs/server.crt"
+
+const KEY : String = "test-certs/server.key"
+
+const CLIENT_CERT : String = "test-certs/client.crt"
+
+const CLIENT_KEY : String = "test-certs/client.key"
+
+# Below the ephemeral range the listeners here are given, so nothing in
+# the suite listens on it: connecting is refused.
+const CLOSED_PORT : Int = 18429
+
+const SECOND : Int = 1000000000
+
+fn starts(s: String, prefix: String) : Bool = string.starts_with(s, prefix)
+
+fn text_or_err(r: Result[[Int], String]) : Result[String, String] = match r {
+  Ok(bs) -> Ok(http.bytes_to_string(bs))
+  Err(e) -> Err(e)
+}
+
+fn conn_error(r: Result[tls.TlsConn, String]) : String / NetTcp + Ffi = match r {
+  Ok(c) -> {
+    tls.close(c)
+    "connected"
+  }
+  Err(e) -> e
+}
+
+fn listener_error(r: Result[tls.TlsListener, String]) : String / Ffi = match r {
+  Ok(l) -> {
+    tls.close_listener(l)
+    "listening"
+  }
+  Err(e) -> e
+}
+
+# Exits rather than raising: a test that dies of an unhandled Cancel is
+# not reported as a failure.
+fn listen_or_fail(port: Int) : tls.TlsListener / NetTcp + Ffi + Process + Stdout = match tls.listen("127.0.0.1", port, CERT, KEY) {
+  Ok(l) -> l
+  Err(e) -> {
+    print("listen #{int_to_string(port)}: #{e}")
+    process.exit(1)
+  }
+}
+
+# Read until `want` plaintext bytes have arrived, or the stream ends.
+fn recv_n(c: tls.TlsConn, want: Int, acc: [Int]) : Result[[Int], String] / NetTcp + Ffi = if list_length(acc) >= want {
+  Ok(acc)
+} else {
+  match tls.recv(c, 4096) {
+    Err(e) -> Err(e)
+    Ok([]) -> Ok(acc)
+    Ok(bs) -> recv_n(c, want, list_append(acc, bs))
+  }
+}
+
+# Accept one connection, read `want` bytes, send them back, close.
+fn echo_once(l: tls.TlsListener, want: Int) : Result[String, String] / NetTcp + Ffi = match tls.accept(l) {
+  Err(e) -> Err(e)
+  Ok(c) -> {
+    let got = recv_n(c, want, [])
+    match got {
+      Ok(bs) -> {
+        let _ = tls.send(c, bs)
+      }
+      Err(_) -> ()
+    }
+    tls.close(c)
+    text_or_err(got)
+  }
+}
+
+# Send `msg` over an open connection, read as many bytes back, close.
+fn round_trip(r: Result[tls.TlsConn, String], msg: String) : Result[String, String] / NetTcp + Ffi = match r {
+  Err(e) -> Err(e)
+  Ok(c) -> {
+    let sent = tls.send(c, http.string_to_bytes(msg))
+    let back = match sent {
+      Err(e) -> Err(e)
+      Ok(_) -> text_or_err(recv_n(c, string_length(msg), []))
+    }
+    tls.close(c)
+    back
+  }
+}
+
+# Accept `n` connections one after another, keeping each accept's error.
+fn accept_failures(l: tls.TlsListener, n: Int, acc: [String]) : [String] / NetTcp + Ffi = if n == 0 {
+  acc
+} else {
+  let e = match tls.accept(l) {
+    Ok(c) -> {
+      tls.close(c)
+      "accepted"
+    }
+    Err(e) -> e
+  }
+  accept_failures(l, n - 1, [e, ...acc])
+}
+
+fn connect_failures(n: Int, dial: () -> Result[tls.TlsConn, String] / NetTcp + Ffi, acc: [String]) : [String] / NetTcp + Ffi = if n == 0 {
+  acc
+} else {
+  connect_failures(n - 1, dial, [conn_error(dial()), ...acc])
+}
+
+# Read from a raw socket until the peer hangs up (true) or stays silent
+# for `secs` seconds (false).
+fn hung_up(c: tcp.Conn, secs: Int) : Bool / NetTcp = match NetTcp.recv_timeout(c, 16384, secs * SECOND) {
+  None -> false
+  Some(Err(_)) -> true
+  Some(Ok([])) -> true
+  Some(Ok(_)) -> hung_up(c, secs)
+}
+
+# A raw TCP client: connect, send `junk` (nothing if empty), and report
+# whether the server hung up.
+fn raw_client_hung_up(port: Int, junk: String) : Bool / NetTcp = match NetTcp.connect("127.0.0.1", port) {
+  Err(_) -> false
+  Ok(c) -> {
+    if string_length(junk) > 0 {
+      let _ = NetTcp.send(c, http.string_to_bytes(junk))
+    }
+    let r = hung_up(c, 3)
+    NetTcp.close(c)
+    r
+  }
+}
+
+# ---- the happy path -------------------------------------------------
+
+test "a verified round trip carries the bytes both ways" {
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => echo_once(l, 4))
+    let cli = spawn(() => round_trip(tls.connect_ca("localhost", port, CA), "ping"))
+    Pair { fst: await(srv), snd: await(cli) }
+  })
+  tls.close_listener(l)
+  assert r.fst == Ok("ping")
+  assert r.snd == Ok("ping")
+}
+
+test "a payload larger than one TLS record arrives whole" {
+  # 40000 bytes span several 16 KiB records and several transport reads.
+  let msg = string.repeat("0123456789", 4000)
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => echo_once(l, 40000))
+    let cli = spawn(() => round_trip(tls.connect_ca("127.0.0.1", port, CA), msg))
+    Pair { fst: await(srv), snd: await(cli) }
+  })
+  tls.close_listener(l)
+  assert r.fst == Ok(msg)
+  assert r.snd == Ok(msg)
+}
+
+test "connect_insecure talks to a server it cannot verify" {
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => echo_once(l, 2))
+    let cli = spawn(() => round_trip(tls.connect_insecure("localhost", port), "hi"))
+    Pair { fst: await(srv), snd: await(cli) }
+  })
+  tls.close_listener(l)
+  assert r.snd == Ok("hi")
+}
+
+test "a clean close reads as the end of the stream" {
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => match tls.accept(l) {
+      Err(e) -> Err(e)
+      Ok(c) -> {
+        let s = tls.send(c, http.string_to_bytes("bye"))
+        tls.close(c)
+        s
+      }
+    })
+    let cli = spawn(() => match tls.connect_ca("localhost", port, CA) {
+      Err(e) -> Pair { fst: Err(e), snd: Err(e) }
+      Ok(c) -> {
+        let first = text_or_err(recv_n(c, 3, []))
+        let after = text_or_err(tls.recv(c, 4096))
+        tls.close(c)
+        Pair { fst: first, snd: after }
+      }
+    })
+    let _ = await(srv)
+    await(cli)
+  })
+  tls.close_listener(l)
+  assert r.fst == Ok("bye")
+  assert r.snd == Ok("")
+}
+
+# ---- verification -------------------------------------------------
+
+test "the system trust store does not vouch for the dev CA" {
+  # No SSL_CERT_FILE in this process: `connect` checks against the OS
+  # store, which has never heard of rongo-test-ca.
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => accept_failures(l, 1, []))
+    let cli = spawn(() => conn_error(tls.connect("localhost", port)))
+    Pair { fst: await(srv), snd: await(cli) }
+  })
+  tls.close_listener(l)
+  assert r.snd == "tls: certificate verification failed"
+  assert r.fst != ["accepted"]
+}
+
+test "a trust root that did not sign the server fails verification" {
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => accept_failures(l, 1, []))
+    let cli = spawn(() => conn_error(tls.connect_ca("localhost", port, CLIENT_CERT)))
+    Pair { fst: await(srv), snd: await(cli) }
+  })
+  tls.close_listener(l)
+  assert r.snd == "tls: certificate verification failed"
+}
+
+test "failed handshakes give their slots back, on both ends" {
+  # 130 failures: more slots than the table has, should either end keep
+  # its own. Both ends draw on the one table, so a slot the server kept
+  # shows up as a client that cannot get one.
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => accept_failures(l, 1000, []))
+    let errs = connect_failures(130, () => tls.connect("localhost", port), [])
+    cancel(srv)
+    errs
+  })
+  tls.close_listener(l)
+  assert list_length(r) == 130
+  assert list.all(r, e => e == "tls: certificate verification failed")
+}
+
+# ---- mutual TLS ---------------------------------------------------
+
+test "an mTLS listener admits a client with a cert and refuses one without" {
+  match tls.listen_mtls("127.0.0.1", 0, CERT, KEY, CA) {
+    Err(e) -> {
+      print(e)
+      assert false
+    }
+    Ok(l) -> {
+      let port = tls.local_port(l)
+      let good = nursery(() => {
+        let srv = spawn(() => echo_once(l, 4))
+        let cli = spawn(() => round_trip(tls.connect_with_cert_ca("localhost", port, CLIENT_CERT, CLIENT_KEY, CA), "mtls"))
+        Pair { fst: await(srv), snd: await(cli) }
+      })
+      let bad = nursery(() => {
+        let srv = spawn(() => accept_failures(l, 1, []))
+        let cli = spawn(() => round_trip(tls.connect_ca("localhost", port, CA), "nope"))
+        Pair { fst: await(srv), snd: await(cli) }
+      })
+      tls.close_listener(l)
+      assert good.fst == Ok("mtls")
+      assert good.snd == Ok("mtls")
+      assert bad.fst != ["accepted"]
+      assert bad.snd != Ok("nope")
+    }
+  }
+}
+
+test "a client cert does not relax server verification" {
+  # connect_with_cert still checks the server against the system store.
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => accept_failures(l, 1, []))
+    let cli = spawn(() => conn_error(tls.connect_with_cert("localhost", port, CLIENT_CERT, CLIENT_KEY)))
+    Pair { fst: await(srv), snd: await(cli) }
+  })
+  tls.close_listener(l)
+  assert r.snd == "tls: certificate verification failed"
+}
+
+# ---- client-side failures -----------------------------------------
+
+test "bad client material is named before any connection is made" {
+  assert conn_error(tls.connect_ca("localhost", CLOSED_PORT, "test-certs/missing.crt")) == "tls: CA file load failed"
+  assert conn_error(tls.connect_with_cert_ca("localhost", CLOSED_PORT, "test-certs/missing.crt", CLIENT_KEY, CA)) == "tls: client certificate load failed"
+  assert conn_error(tls.connect_with_cert_ca("localhost", CLOSED_PORT, CLIENT_CERT, KEY, CA)) == "tls: client private key load failed or mismatched"
+}
+
+test "a refused connection names the transport and frees its slot" {
+  # 130 refusals: more than the slot table holds, so a leaked slot would
+  # turn the later ones into "SSL init failed".
+  let errs = connect_failures(130, () => tls.connect_ca("127.0.0.1", CLOSED_PORT, CA), [])
+  assert list_length(errs) == 130
+  assert list.all(errs, e => starts(e, "tls: connect: "))
+}
+
+test "a peer that hangs up mid-handshake is reported as such" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> {
+      print(e)
+      assert false
+    }
+    Ok(raw) -> {
+      let port = tcp.local_port(raw)
+      let r = nursery(() => {
+        let srv = spawn(() => match NetTcp.accept(raw) {
+          Err(_) -> ()
+          Ok(c) -> {
+            let _ = NetTcp.recv_timeout(c, 16384, 3 * SECOND)
+            NetTcp.close(c)
+          }
+        })
+        let cli = spawn(() => conn_error(tls.connect_ca("localhost", port, CA)))
+        await(srv)
+        await(cli)
+      })
+      assert r == "tls: peer closed during handshake"
+    }
+  }
+}
+
+test "a peer that answers with garbage fails the handshake and is hung up on" {
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> {
+      print(e)
+      assert false
+    }
+    Ok(raw) -> {
+      let port = tcp.local_port(raw)
+      let r = nursery(() => {
+        let srv = spawn(() => match NetTcp.accept(raw) {
+          Err(_) -> false
+          Ok(c) -> {
+            let _ = NetTcp.recv_timeout(c, 16384, 3 * SECOND)
+            let _ = NetTcp.send(c, http.string_to_bytes("HTTP/1.1 400 Bad Request\r\n\r\n"))
+            let h = hung_up(c, 3)
+            NetTcp.close(c)
+            h
+          }
+        })
+        let cli = spawn(() => conn_error(tls.connect_ca("localhost", port, CA)))
+        Pair { fst: await(srv), snd: await(cli) }
+      })
+      assert r.snd == "tls: handshake failed"
+      assert r.fst
+    }
+  }
+}
+
+# ---- server-side failures -----------------------------------------
+
+test "a client that is not speaking TLS is refused and hung up on" {
+  # The raw client holds no slot, so the accepted connection takes slot
+  # 0: the first slot is as usable as any other.
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  let r = nursery(() => {
+    let srv = spawn(() => accept_failures(l, 1, []))
+    let cli = spawn(() => raw_client_hung_up(port, "GET / HTTP/1.1\r\n\r\n"))
+    Pair { fst: await(srv), snd: await(cli) }
+  })
+  tls.close_listener(l)
+  assert r.fst == ["tls: handshake failed"]
+  assert r.snd
+}
+
+test "accepting on a released listener fails and drops the connection" {
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  tls.close_listener(l)
+  let r = nursery(() => {
+    let srv = spawn(() => accept_failures(l, 1, []))
+    let cli = spawn(() => raw_client_hung_up(port, ""))
+    Pair { fst: await(srv), snd: await(cli) }
+  })
+  assert r.fst == ["tls: accept SSL init failed"]
+  assert r.snd
+}
+
+test "bad listener material is named" {
+  assert listener_error(tls.listen("127.0.0.1", 0, "test-certs/missing.crt", KEY)) == "tls: server certificate load failed"
+  assert listener_error(tls.listen("127.0.0.1", 0, CERT, CLIENT_KEY)) == "tls: private key load failed or mismatched"
+  assert listener_error(tls.listen_mtls("127.0.0.1", 0, CERT, KEY, "test-certs/missing.crt")) == "tls: client-CA file load failed (mTLS)"
+}
+
+test "a listener that cannot bind gives its context back" {
+  # The port is taken, so every attempt after the first fails to bind.
+  # 20 of them would fill the 16-entry listener table if a failure kept
+  # its context; a fresh listen afterwards must still work.
+  let held = listen_or_fail(0)
+  let port = tls.local_port(held)
+  let errs = list.map(list.repeat(0, 20), i => listener_error(tls.listen("127.0.0.1", port, CERT, KEY)))
+  assert list.all(errs, e => starts(e, "tls: listen: "))
+  assert listener_error(tls.listen("127.0.0.1", 0, CERT, KEY)) == "listening"
+  tls.close_listener(held)
+}
+
+# ---- close ----------------------------------------------------------
+
+# Forward bytes from `src` to `dst` until `src` hangs up or stays silent
+# for a second. Reports when each chunk arrived and whether `src` hung up.
+fn pump(src: tcp.Conn, dst: tcp.Conn, times: [Instant]) : Pair[[Instant], Bool] / NetTcp + Clock = match NetTcp.recv_timeout(src, 16384, SECOND) {
+  None -> Pair { fst: times, snd: false }
+  Some(Err(_)) -> Pair { fst: times, snd: true }
+  Some(Ok([])) -> Pair { fst: times, snd: true }
+  Some(Ok(bs)) -> {
+    let t = monotonic()
+    let _ = NetTcp.send(dst, bs)
+    pump(src, dst, [t, ...times])
+  }
+}
+
+# A TCP relay between one client and `upstream`, watching what the
+# client sends. Returns the client-to-server pump's report.
+fn relay(front: tcp.Listener, upstream: Int) : Pair[[Instant], Bool] / NetTcp + Clock + Spawn = match NetTcp.accept(front) {
+  Err(_) -> Pair { fst: [], snd: false }
+  Ok(a) -> match NetTcp.connect("127.0.0.1", upstream) {
+    Err(_) -> {
+      NetTcp.close(a)
+      Pair { fst: [], snd: false }
+    }
+    Ok(b) -> nursery(() => {
+      let up = spawn(() => pump(a, b, []))
+      let down = spawn(() => pump(b, a, []))
+      let seen = await(up)
+      NetTcp.close(b)
+      let _ = await(down)
+      NetTcp.close(a)
+      seen
+    })
+  }
+}
+
+test "close sends close_notify and then hangs up the transport" {
+  let l = listen_or_fail(0)
+  let port = tls.local_port(l)
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> {
+      print(e)
+      assert false
+    }
+    Ok(front) -> {
+      let front_port = tcp.local_port(front)
+      let r = nursery(() => {
+        let tap = spawn(() => relay(front, port))
+        let srv = spawn(() => match tls.accept(l) {
+          Err(e) -> Err(e)
+          Ok(c) -> {
+            let got = recv_n(c, 4, [])
+            let _ = tls.send(c, http.string_to_bytes("pong"))
+            let _ = tls.recv(c, 4096)
+            tls.close(c)
+            text_or_err(got)
+          }
+        })
+        let cli = spawn(() => match tls.connect_ca("localhost", front_port, CA) {
+          Err(e) -> Err(e)
+          Ok(c) -> {
+            let _ = tls.send(c, http.string_to_bytes("ping"))
+            let _ = recv_n(c, 4, [])
+            let t = monotonic()
+            tls.close(c)
+            Ok(t)
+          }
+        })
+        let closing = await(cli)
+        let _ = await(srv)
+        Pair { fst: closing, snd: await(tap) }
+      })
+      tls.close_listener(l)
+      match r.fst {
+        Err(e) -> {
+          print(e)
+          assert false
+        }
+        Ok(t) -> {
+          # Bytes after the client started closing: the close_notify alert.
+          assert list.any(r.snd.fst, at => instant_lt(t, at))
+          # And then the transport itself was closed.
+          assert r.snd.snd
+        }
+      }
+    }
+  }
+}
+
+fn main() : Int = 0

@@ -1,0 +1,383 @@
+# The HTTPS server over loopback: `serve` / `serve_with` on rongo's own
+# listener, driven by rongo's client. Where the request has to be
+# something the client would never write, the test writes the bytes
+# itself over a TLS connection and reads back the raw response. Nothing
+# leaves 127.0.0.1.
+
+import rongo.http_server
+
+import rongo.https
+
+import rongo.ffi.tls
+
+import net.http
+
+import os.process
+
+import spawn
+
+import time
+
+const CA : String = "test-certs/ca.crt"
+
+fn listen_or_exit(port: Int) : tls.TlsListener / NetTcp + Ffi + Process + Stdout = match tls.listen("127.0.0.1", port, "test-certs/server.crt", "test-certs/server.key") {
+  Ok(l) -> l
+  Err(e) -> {
+    print("listen #{int_to_string(port)}: #{e}")
+    process.exit(1)
+  }
+}
+
+# A Cancel that escapes a test body ends the run without failing it, so
+# a server that unwinds is turned into a value the test can assert on.
+fn or_cancelled[a, e](fallback: a, body: () -> a / Cancel + e) : a / e = handle {
+  body()
+} with Cancel {
+  raise(resume) -> fallback
+}
+
+fn header(hs: [http.HttpHeader], name: String) : String = match http.header_lookup(hs, name) {
+  Some(v) -> v
+  None -> ""
+}
+
+fn handler(req: http.Request) : http.Response / Cancel = if req.url == "/crash" {
+  Cancel.raise()
+} else if req.url == "/close" {
+  http.Response { status: 200, headers: [http.HttpHeader { name: "Connection", value: "close" }], body: "bye" }
+} else if req.url == "/close-lower" {
+  http.Response { status: 200, headers: [http.HttpHeader { name: "connection", value: "CLOSE" }], body: "bye" }
+} else if req.url == "/close-spaced" {
+  http.Response { status: 200, headers: [http.HttpHeader { name: "Connection", value: " close " }], body: "bye" }
+} else if req.url == "/keep" {
+  http.Response { status: 200, headers: [http.HttpHeader { name: "Connection", value: "keep-alive" }], body: "kept" }
+} else if req.url == "/len" {
+  http.Response { status: 200, headers: [], body: int_to_string(string_length(req.body)) }
+} else {
+  http.Response { status: 200, headers: [], body: "you asked for #{req.url}" }
+}
+
+fn serve_on(l: tls.TlsListener, cfg: http_server.Config) : Unit / NetTcp + Ffi + Spawn = http_server.serve_with(l, cfg, r => or_cancelled(http.Response { status: 0 - 1, headers: [], body: "handler unwound" }, () => handler(r)))
+
+fn with_config(max_bytes: Int, max_conns: Int, keep: Bool) : http_server.Config = http_server.Config { max_request_bytes: max_bytes, max_connections: max_conns, keep_alive: keep }
+
+fn url(port: Int, path: String) : String = "https://localhost:#{int_to_string(port)}#{path}"
+
+# ---- a raw client -----------------------------------------------------
+
+fn send_parts(c: tls.TlsConn, parts: [String]) : Unit / NetTcp + Ffi + Clock = match parts {
+  [] -> ()
+  [p, ...rest] -> {
+    let _ = tls.send(c, http.string_to_bytes(p))
+    match rest {
+      [] -> ()
+      _ -> sleep(millis(20))
+    }
+    send_parts(c, rest)
+  }
+}
+
+fn read_response(c: tls.TlsConn, acc: String) : String / NetTcp + Ffi = if https.response_complete(acc, "GET") {
+  acc
+} else {
+  match tls.recv(c, 4096) {
+    Err(_) -> acc
+    Ok([]) -> acc
+    Ok(bs) -> read_response(c, string_concat(acc, http.bytes_to_string(bs)))
+  }
+}
+
+fn at_end(c: tls.TlsConn) : Bool / NetTcp + Ffi = match tls.recv(c, 4096) {
+  Ok([]) -> true
+  Err(_) -> true
+  Ok(_) -> false
+}
+
+# What came back for one raw request.
+type Reply = { status: Int, connection: [String], body: String, closed: Bool }
+
+fn connection_values(hs: [http.HttpHeader]) : [String] = list.map(list.filter(hs, h => string.to_lower(h.name) == "connection"), h => h.value)
+
+# Send `parts`, read one response, and — when the response says the
+# server is closing — check that it did. A response the server is keeping
+# open is not waited on.
+fn raw_request(port: Int, parts: [String]) : Reply / NetTcp + Ffi + Clock = match tls.connect_ca("localhost", port, CA) {
+  Err(e) -> Reply { status: 0 - 1, connection: [], body: e, closed: false }
+  Ok(c) -> {
+    send_parts(c, parts)
+    let raw = read_response(c, "")
+    let r = match http.parse_response(raw) {
+      Err(_) -> Reply { status: 0, connection: [], body: raw, closed: true }
+      Ok(resp) -> {
+        let conn = connection_values(resp.headers)
+        let closed = if conn == ["close"] {
+          at_end(c)
+        } else {
+          false
+        }
+        Reply { status: resp.status, connection: conn, body: resp.body, closed: closed }
+      }
+    }
+    tls.close(c)
+    r
+  }
+}
+
+fn get_line(path: String, extra: String) : String = "GET #{path} HTTP/1.1\r\nHost: localhost\r\n#{extra}\r\n"
+
+# ---- keep-alive -------------------------------------------------------
+
+test "a keep-alive connection serves request after request" {
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled(["unwound"], () => nursery(() => {
+    let srv = spawn(() => http_server.serve(l, r => or_cancelled(http.Response { status: 0 - 1, headers: [], body: "" }, () => handler(r))))
+    let got = match https.open_session_ca("localhost", port, CA) {
+      Err(e) -> [e]
+      Ok(s) -> {
+        let a = https.session_get(s, url(port, "/a"))
+        let b = https.session_get(s, url(port, "/b"))
+        let k = https.session_get(s, url(port, "/keep"))
+        let c = https.session_get(s, url(port, "/c"))
+        https.close_session(s)
+        [a.body, header(a.headers, "Connection"), b.body, k.body, header(k.headers, "Connection"), c.body]
+      }
+    }
+    cancel(srv)
+    got
+  }))
+  tls.close_listener(l)
+  assert r == ["you asked for /a", "keep-alive", "you asked for /b", "kept", "keep-alive", "you asked for /c"]
+}
+
+test "a client's Connection: close ends the connection, in any letter case" {
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled([], () => nursery(() => {
+    let srv = spawn(() => serve_on(l, http_server.default_config()))
+    let a = raw_request(port, [get_line("/a", "Connection: close\r\n")])
+    let b = raw_request(port, [get_line("/b", "connection: Close\r\n")])
+    let c = raw_request(port, [get_line("/c", "Connection: keep-alive\r\n")])
+    cancel(srv)
+    [a, b, c]
+  }))
+  tls.close_listener(l)
+  match r {
+    [a, b, c] -> {
+      assert a.body == "you asked for /a"
+      assert a.connection == ["close"]
+      assert a.closed
+      assert b.connection == ["close"]
+      assert b.closed
+      assert c.connection == ["keep-alive"]
+    }
+    _ -> {
+      assert false
+    }
+  }
+}
+
+test "a handler's Connection: close is honoured and sent once" {
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled([], () => nursery(() => {
+    let srv = spawn(() => serve_on(l, http_server.default_config()))
+    let a = raw_request(port, [get_line("/close", "")])
+    let b = raw_request(port, [get_line("/close-lower", "")])
+    let c = raw_request(port, [get_line("/close-spaced", "")])
+    cancel(srv)
+    [a, b, c]
+  }))
+  tls.close_listener(l)
+  assert list_length(r) == 3
+  assert list.all(r, x => ((x.body == "bye") and (x.connection == ["close"])) and x.closed)
+}
+
+test "keep_alive off closes after one response" {
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled(Reply { status: 0 - 1, connection: [], body: "unwound", closed: false }, () => nursery(() => {
+    let srv = spawn(() => serve_on(l, with_config(1048576, 64, false)))
+    let a = raw_request(port, [get_line("/a", "")])
+    cancel(srv)
+    a
+  }))
+  tls.close_listener(l)
+  assert r.body == "you asked for /a"
+  assert r.connection == ["close"]
+  assert r.closed
+}
+
+# ---- what the server refuses -------------------------------------------
+
+test "a handler that raises gets a 500, and the server keeps serving" {
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled([], () => nursery(() => {
+    let srv = spawn(() => http_server.serve(l, handler))
+    let a = raw_request(port, [get_line("/crash", "")])
+    let b = raw_request(port, [get_line("/after", "")])
+    cancel(srv)
+    [a, b]
+  }))
+  tls.close_listener(l)
+  match r {
+    [a, b] -> {
+      assert a.status == 500
+      assert a.body == "internal server error"
+      assert a.connection == ["close"]
+      assert a.closed
+      assert b.status == 200
+      assert b.body == "you asked for /after"
+    }
+    _ -> {
+      assert false
+    }
+  }
+}
+
+test "a chunked request is refused with 411 and the connection closed" {
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled([], () => nursery(() => {
+    let srv = spawn(() => serve_on(l, http_server.default_config()))
+    let a = raw_request(port, ["POST /len HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"])
+    # A head that is nothing but the header still counts.
+    let b = raw_request(port, ["Transfer-Encoding: chunked\r\n\r\n"])
+    cancel(srv)
+    [a, b]
+  }))
+  tls.close_listener(l)
+  match r {
+    [a, b] -> {
+      assert a.status == 411
+      assert a.body == "chunked request bodies not supported"
+      assert a.connection == ["close"]
+      assert a.closed
+      assert b.status == 411
+    }
+    _ -> {
+      assert false
+    }
+  }
+}
+
+test "only the head can make a request chunked" {
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled([], () => nursery(() => {
+    let srv = spawn(() => serve_on(l, http_server.default_config()))
+    # The body carries a line that would be the header, were it in the head.
+    let a = raw_request(port, ["POST /len HTTP/1.1\r\nContent-Length: 29\r\n\r\nx\r\nTransfer-Encoding: chunked"])
+    # Nothing before the blank line: no head, so not chunked — and not a
+    # request either, so it is dropped without an answer.
+    let b = raw_request(port, ["\r\n\r\nTransfer-Encoding: chunked\r\n"])
+    cancel(srv)
+    [a, b]
+  }))
+  tls.close_listener(l)
+  match r {
+    [a, b] -> {
+      assert a.status == 200
+      assert a.body == "29"
+      assert b.status == 0
+      assert b.body == ""
+    }
+    _ -> {
+      assert false
+    }
+  }
+}
+
+test "a body that arrives in pieces is reassembled" {
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled(Reply { status: 0 - 1, connection: [], body: "unwound", closed: false }, () => nursery(() => {
+    let srv = spawn(() => serve_on(l, http_server.default_config()))
+    let a = raw_request(port, ["POST /len HTTP/1.1\r\nContent-Length: 10\r\n", "\r\nhello", "world"])
+    cancel(srv)
+    a
+  }))
+  tls.close_listener(l)
+  assert r.status == 200
+  assert r.body == "10"
+}
+
+test "max_request_bytes admits a request of exactly that size, however it arrives" {
+  # 42 bytes of head plus an 18-byte body: 60 bytes in all.
+  let head = "POST /len HTTP/1.1\r\nContent-Length: 18\r\n\r\n"
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled([], () => nursery(() => {
+    let srv = spawn(() => serve_on(l, with_config(60, 64, true)))
+    let whole = raw_request(port, [string_concat(head, "abcdefghijklmnopqr")])
+    let split = raw_request(port, [head, "abcdefghijklmnopqr"])
+    cancel(srv)
+    [whole, split]
+  }))
+  tls.close_listener(l)
+  assert list_length(r) == 2
+  assert list.all(r, x => (x.status == 200) and (x.body == "18"))
+}
+
+test "max_request_bytes refuses a larger request, however it arrives" {
+  # One byte over the cap. Whether the bytes come in one read or several,
+  # the connection is dropped without an answer.
+  let head = "POST /len HTTP/1.1\r\nContent-Length: 19\r\n\r\n"
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled([], () => nursery(() => {
+    let srv = spawn(() => serve_on(l, with_config(60, 64, true)))
+    let whole = raw_request(port, [string_concat(head, "abcdefghijklmnopqrs")])
+    let split = raw_request(port, [head, "abcdefghijklmnopqrs"])
+    cancel(srv)
+    [whole, split]
+  }))
+  tls.close_listener(l)
+  assert list_length(r) == 2
+  assert list.all(r, x => (x.status == 0) and (x.body == ""))
+}
+
+# ---- the connection cap ---------------------------------------------
+
+test "max_connections turns away a connection past the cap, and recovers" {
+  let l = listen_or_exit(0)
+  let port = tls.local_port(l)
+  let r = or_cancelled([], () => nursery(() => {
+    let srv = spawn(() => serve_on(l, with_config(1048576, 1, true)))
+    let got = match https.open_session_ca("localhost", port, CA) {
+      Err(e) -> [e]
+      Ok(a) -> {
+        let first = https.session_get(a, url(port, "/first")).status
+        # A is still open, so B is one past the cap: it completes the
+        # handshake and is then hung up on.
+        let second = match https.open_session_ca("localhost", port, CA) {
+          Err(_) -> 0 - 1
+          Ok(b) -> {
+            let st = https.session_get(b, url(port, "/second")).status
+            https.close_session(b)
+            st
+          }
+        }
+        https.close_session(a)
+        # Give A's fiber time to end and report it.
+        sleep(millis(200))
+        let third = match https.open_session_ca("localhost", port, CA) {
+          Err(_) -> 0 - 1
+          Ok(c) -> {
+            let st = https.session_get(c, url(port, "/third")).status
+            https.close_session(c)
+            st
+          }
+        }
+        [int_to_string(first), int_to_string(second), int_to_string(third)]
+      }
+    }
+    cancel(srv)
+    got
+  }))
+  tls.close_listener(l)
+  assert r == ["200", "0", "200"]
+}
+
+fn main() : Int = 0
