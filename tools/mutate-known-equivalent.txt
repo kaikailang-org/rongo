@@ -1,0 +1,49 @@
+# Mutants that mean exactly what the original means, and so can never
+# be killed. Keyed <file>:<line>:<operator>; the reason is mandatory.
+
+rongo/ffi/tls_proto.kai:50:compare  # step_of: `code <= OK` vs `code < OK`. The only code that tells them apart is OK itself, and the first branch has already returned Done for it.
+rongo/ffi/tls_proto.kai:80:literal  # frame_of: the payload slice grows by one byte past the end of the frame, and string_slice clamps to the string, so it is the same payload.
+
+rongo/https.kai:33:literal  # find_loop: the empty-needle answer (0 vs 1) is never asked for. Every caller passes a literal needle (":", "/", "://", "\r\n\r\n", "chunked"), none of them empty.
+rongo/https.kai:48:literal  # split_authority: the port slice grows past the end of the authority, and string_slice clamps, so it is the same port text.
+rongo/https.kai:78:literal  # parse_url: the slice after "://" grows past the end of the URL, and string_slice clamps, so it is the same remainder.
+rongo/https.kai:88:compare  # parse_url: `path_at <= 0` differs only at path_at == 0, where the authority is empty and the URL is refused as "empty host" whichever path is computed.
+rongo/https.kai:88:literal  # parse_url: `path_at < 1`, the same boundary as the compare entry above: at 0 the host is empty and the URL is refused either way.
+rongo/https.kai:127:literal  # serialize: `string_length(u.path) == 1` takes the "/" branch only for a one-byte path, and parse_url only produces paths that start with "/", so that path is "/" already. The empty path the original guards against is never produced.
+rongo/https.kai:241:literal  # status_of: an unparseable code read as 1 instead of 0. The status only feeds bodyless, and neither 0 nor 1 is HEAD-like, 1xx, 204 or 304, so the framing decision is the same.
+rongo/https.kai:243:literal  # status_of: a status line with fewer than two fields read as 1 instead of 0; the same argument as the entry above.
+rongo/https.kai:257:compare  # chunked_complete: `crlf <= 0` differs only at crlf == 0, but the search starts at the body, at least four bytes in, so a found CRLF is never at 0.
+rongo/https.kai:257:literal  # chunked_complete: `crlf < 1`, the same boundary as the compare entry above.
+rongo/https.kai:266:compare  # chunked_complete: `> 0` vs `>= 0` on a search that starts at the body, at least four bytes in, so it returns -1 or an index of 4 or more.
+rongo/https.kai:266:literal  # chunked_complete: `>= 1`, the same boundary as the compare entry above.
+rongo/https.kai:271:compare  # chunked_complete: at next == length the original recurses at the end of the text, where no CRLF can be found, and answers false — what the mutant answers at once.
+rongo/https.kai:304:compare  # parse_hex_loop: at i == n the mutant goes on to char_at, which returns None past the end, and the None arm returns the same Some(acc).
+rongo/https.kai:340:compare  # parse_header_lines: a line whose colon is at 0 yields a header with the empty name, which header_ci is never asked for; skipping it is the same.
+rongo/https.kai:340:literal  # parse_header_lines: `i < 1`, the same boundary as the compare entry above.
+rongo/https.kai:344:literal  # parse_header_lines: the value slice grows past the end of the line, and string_slice clamps, so it is the same value.
+rongo/https.kai:407:literal  # rtrim: returning 1 instead of 0 when the scan reaches the start only happens for an all-whitespace string, where ltrim has already advanced to its length (at least 1), so hi <= lo and trim returns "" either way.
+rongo/https.kai:361:compare  # lower_char: leaving 'Z' upper-case changes nothing lower() is compared with: "transfer-encoding", "content-length" and "chunked" contain no 'z'.
+rongo/https.kai:369:compare  # char_list_loop: at i == n the mutant goes on to char_at, which returns None past the end, and the None arm returns the same reversed list.
+rongo/https.kai:374:call  # char_list_loop: the None arm is unreachable — the loop only calls char_at for i < n, where it is Some.
+rongo/https.kai:384:compare  # trim: at hi == lo the mutant slices zero bytes, which is the "" the original returns.
+rongo/https.kai:393:compare  # ltrim: at i == n the mutant goes on to char_at, which returns None past the end, and the None arm returns the same i.
+rongo/https.kai:406:compare  # rtrim: at i == 0 the mutant reads char_at(s, -1), which is None, and the None arm returns the same 0.
+
+rongo/http_server.kai:115:negate  # read_request_loop: ReadClosed and ReadError on a peer close lead serve_requests to the same tls.close and nothing else; which one is reported is not observable.
+rongo/http_server.kai:115:literal  # read_request_loop: `have == 1`, the same choice between ReadClosed and ReadError as the negate entry above, both of which only close.
+rongo/http_server.kai:168:compare  # te_scan: a line whose colon is at 0 has the empty name, which is never "transfer-encoding", so skipping it and inspecting it both go on to the next line.
+rongo/http_server.kai:168:literal  # te_scan: `i < 1`, the same boundary as the compare entry above.
+rongo/http_server.kai:171:literal  # te_scan: the value slice grows past the end of the line, and string_slice clamps, so it is the same value.
+rongo/http_server.kai:188:compare  # cl_scan: a line whose colon is at 0 has the empty name, which is never "content-length", so skipping it and inspecting it both go on to the next line.
+rongo/http_server.kai:188:literal  # cl_scan: `i < 1`, the same boundary as the compare entry above.
+rongo/http_server.kai:191:literal  # cl_scan: the value slice grows past the end of the line, and string_slice clamps, so it is the same value.
+rongo/http_server.kai:323:literal  # drain_done: a 1 ns receive deadline instead of 0 still polls the mailbox without waiting for anything; a message that arrives within that nanosecond would equally be read on the next accept.
+rongo/http_server.kai:325:call  # drain_done: draining one ConnDone per accept instead of all of them gives the same admit/refuse decision on every accept. The count it keeps is the live connections plus the undrained messages, which never exceeds max_connections; with a message pending it is lowered by one before the comparison, so it refuses only when the true count is at the cap, as the original does.
+rongo/http_server.kai:356:literal  # find_loop: the empty-needle answer (0 vs 1) is never asked for. Every caller passes a literal needle (":", "\r\n\r\n", "chunked"), none of them empty.
+rongo/http_server.kai:367:compare  # lower_char: leaving 'Z' upper-case changes nothing lower() is compared with: "transfer-encoding", "content-length", "connection", "close" and "chunked" contain no 'z'.
+rongo/http_server.kai:375:compare  # char_list_loop: at i == n the mutant goes on to char_at, which returns None past the end, and the None arm returns the same reversed list.
+rongo/http_server.kai:380:call  # char_list_loop: the None arm is unreachable — the loop only calls char_at for i < n, where it is Some.
+rongo/http_server.kai:388:compare  # trim: at hi == lo the mutant slices zero bytes, which is the "" the original returns.
+rongo/http_server.kai:397:compare  # ltrim: at i == n the mutant goes on to char_at, which returns None past the end, and the None arm returns the same i.
+rongo/http_server.kai:410:compare  # rtrim: at i == 0 the mutant reads char_at(s, -1), which is None, and the None arm returns the same 0.
+rongo/http_server.kai:411:literal  # rtrim: returning 1 instead of 0 when the scan reaches the start only happens for an all-whitespace string, where ltrim has already advanced to its length (at least 1), so hi <= lo and trim returns "" either way.
