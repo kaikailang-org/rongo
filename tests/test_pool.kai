@@ -40,4 +40,27 @@ test "an empty host always has room" {
   assert pool.should_keep(0, pool.default_pool_config())
 }
 
+test "the default pool keeps an idle connection for 90 seconds" {
+  let cfg = pool.default_pool_config()
+  assert cfg.max_per_host == 8
+  assert pool.is_fresh(at(0), at(89000000000), cfg.max_idle)
+  assert not pool.is_fresh(at(0), at(90000000000), cfg.max_idle)
+}
+
+test "a URL the pool cannot parse fails without a connection" {
+  let p = pool.new_pool(pool.default_pool_config())
+  let r = pool.get(p, "http://example.com/")
+  assert r.status == 0
+  assert r.body == "https.parse_url: only https:// is supported (got 'http://')"
+}
+
+test "a connection the pool cannot open is a status-0 response" {
+  # Nothing listens on this loopback port, so the connect is refused.
+  let p = pool.new_pool(pool.default_pool_config())
+  let r = pool.get(p, "https://127.0.0.1:18499/")
+  assert r.status == 0
+  assert string.starts_with(r.body, "connect: tls: connect: ")
+  pool.close_pool(p)
+}
+
 fn main() : Int = 0
