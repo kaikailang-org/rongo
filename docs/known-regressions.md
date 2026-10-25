@@ -9,52 +9,6 @@ This file follows ahu's and kohau's convention: bugs found outside
 rongo's lane are documented here, not fixed inline. rongo does not
 patch kaikai.
 
-## kaikai 0.174.0
-
-### A test that dies of an unhandled `Cancel` passes the run
-
-**Symptom.** When a `test` block lets a `Cancel.raise` escape, the test
-binary prints `kai: Cancel.raise: unhandled (fiber cancelled)` and stops:
-the remaining blocks of that file never run, the file reports no
-summary, and `kai test` still exits 0. A trap (division by zero, say)
-exits 1 as it should; only the cancellation is lost.
-
-```kaikai
-fn boom() : Int / Cancel = Cancel.raise()
-
-test "crash" {
-  assert boom() == 1
-}
-
-test "after" {
-  assert 1 == 2   # never runs
-}
-
-fn main() : Int = 0
-```
-
-```
-$ kai test a_test.kai; echo $?
-kai: Cancel.raise: unhandled (fiber cancelled)
-0
-```
-
-`--json` behaves the same: no record for either block, exit 0.
-
-**Impact on rongo.** The live tests run servers inside a nursery, and a
-nursery re-raises a child's cancellation out of its scope, so a server
-fiber that unwinds would end the file as a pass. `kai mutate` judges a
-mutant by the same exit code, so a mutant that makes something unwind
-would be reported as a survivor that nothing noticed — or worse, a
-broken suite would look green.
-
-**Workaround.** No test lets a `Cancel` reach the runner: a setup step
-that cannot go on exits the process with status 1 (`process.exit`)
-instead of raising, and the HTTP server's tests — whose handler raises
-on purpose — run their nursery under a `Cancel` handler that turns an
-unwind into a value the test asserts on.
-The suite does not depend on the fix, but new tests must keep to this.
-
 ## kaikai 0.123.0
 
 ### A `String` forwarded through a call is freed at the call site
